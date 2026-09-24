@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
+use tokio_util::task::TaskTracker;
 
 async fn shutdown_signal() {
     #[cfg(unix)]
@@ -69,6 +70,9 @@ async fn main() -> std::io::Result<()> {
         cfg: Arc::new(cfg.clone()),
         ca,
         downloads: Arc::new(Semaphore::new(cfg.max_downloads.max(1))),
+        connections: Arc::new(Semaphore::new(cfg.max_connections.max(1))),
+        tunnels: Arc::new(Semaphore::new(cfg.max_tunnels.max(1))),
+        upgrades: Arc::new(TaskTracker::new()),
         allowed_ports: Arc::new(allowed_ports),
         mitm_ports: Arc::new(mitm_ports),
         metrics: Arc::new(state::Metrics::default()),
@@ -83,15 +87,14 @@ async fn main() -> std::io::Result<()> {
     tracing::info!(%listen, workers = cfg.workers, "segmented proxy listening");
     if shared.ca.is_some() {
         tracing::info!("use: curl -k --proxy http://{listen} https://example.com/file");
-        tracing::info!(
-            "  or trust --ca-out PEM via REQUESTS_CA_BUNDLE and drop --no-check-certificate"
-        );
+        tracing::info!("  or trust the exported --ca-out PEM with curl --cacert");
     }
     tracing::info!(
         "or without MITM: curl \"http://{listen}/__fetch?url=<percent-encoded-https-url>\""
     );
 
     let header_timeout = Duration::from_secs(cfg.header_timeout_secs);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut conns = tokio::task::JoinSet::new();
     // Stop accepting on signal; in-flight downloads drain within the grace
     // period instead of being cut mid-byte.
@@ -100,6 +103,7 @@ async fn main() -> std::io::Result<()> {
         tokio::select! {
             biased;
             _ = &mut shutdown => {
+                let _ = shutdown_tx.send(true);
                 tracing::info!("shutdown signal; draining in-flight downloads");
                 break;
             }
@@ -110,34 +114,48 @@ async fn main() -> std::io::Result<()> {
                     Ok(x) => x,
                     Err(e) => {
                         tracing::warn!(error = %e, "accept failed; continuing");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
                 };
                 let shared = shared.clone();
+                let Ok(connection_permit) = shared.connections.clone().try_acquire_owned() else {
+                    shared.metrics.refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                };
+                let connection_shutdown = shutdown_rx.clone();
                 conns.spawn(async move {
                     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+                    let _connection_permit = connection_permit;
+                    let mut shutdown_rx = connection_shutdown;
                     let io = TokioIo::new(stream);
                     let svc = hyper::service::service_fn(move |req| {
                         let shared = shared.clone();
                         proxy::handle(req, shared)
                     });
-                    // Upgrades (CONNECT) require the `with_upgrades` path;
-                    // plain `serve_connection` rejects `hyper::upgrade::on`.
-                    // The header timer bounds slow-loris clients (hyper
-                    // panics if a read timeout is set without a timer).
+                    // HTTP/2 is not enabled downstream, so the auto builder
+                    // dispatches directly to HTTP/1 and applies its timer.
                     let mut builder =
                         hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
                     builder.http1().timer(TokioTimer::new());
                     if cfg.header_timeout_secs > 0 {
                         builder.http1().header_read_timeout(header_timeout);
                     }
-                    if let Err(e) = builder
-                        .serve_connection_with_upgrades(io, svc)
-                        .await
-                    {
-                        tracing::debug!(%peer, error = %e, "downstream closed");
+                    let connection = builder.serve_connection_with_upgrades(io, svc);
+                    tokio::pin!(connection);
+                    tokio::select! {
+                        result = &mut connection => {
+                            if let Err(e) = result {
+                                tracing::debug!(%peer, error = %e, "downstream closed");
+                            }
+                        }
+                        _ = shutdown_rx.changed() => {
+                            connection.as_mut().graceful_shutdown();
+                            let _ = connection.await;
+                        }
                     }
                 });
+                while conns.try_join_next().is_some() {}
             }
         }
     }
@@ -145,7 +163,13 @@ async fn main() -> std::io::Result<()> {
     // Refuse new SYNs during the drain instead of letting them pile in
     // the backlog behind a process that is going away.
     drop(listener);
-    drain_conns(&mut conns, grace).await;
+    shared.upgrades.close();
+    let upgrades = shared.upgrades.clone();
+    let _ = tokio::time::timeout(grace, async {
+        let (connections, upgraded) = tokio::join!(drain_conns(&mut conns, grace), upgrades.wait());
+        let _ = (connections, upgraded);
+    })
+    .await;
     Ok(())
 }
 

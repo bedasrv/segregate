@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-use http::{HeaderMap, HeaderValue, Uri};
+use http::{HeaderMap, Uri};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
+use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::task::TaskTracker;
 
 use crate::cert::CaAuthority;
 use crate::config::Config;
@@ -21,6 +23,9 @@ pub struct Shared {
     pub origin: Origin,
     pub ca: Option<Arc<CaAuthority>>,
     pub downloads: Arc<Semaphore>,
+    pub connections: Arc<Semaphore>,
+    pub tunnels: Arc<Semaphore>,
+    pub upgrades: Arc<TaskTracker>,
     pub allowed_ports: Arc<HashSet<u16>>,
     pub mitm_ports: Arc<HashSet<u16>>,
     pub metrics: Arc<Metrics>,
@@ -45,6 +50,15 @@ impl Origin {
         }
     }
 
+    /// Acquire one active-origin permit for raw CONNECT tunnels.
+    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, OriginError> {
+        self.sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| OriginError::PoolClosed)
+    }
+
     /// One origin exchange: acquires a pool permit (times out via the
     /// caller's `timeout`, counting as a transient failure) and issues the
     /// request. Hold the permit while streaming the body.
@@ -52,13 +66,7 @@ impl Origin {
         &self,
         req: Request<BoxBody>,
     ) -> Result<(Response<Incoming>, OwnedSemaphorePermit), OriginError> {
-        let permit = match self.sem.clone().acquire_owned().await {
-            // Unreachable today: nothing ever calls `Semaphore::close`, and
-            // the `Arc` keeps it alive. Returned as an error (never a panic)
-            // so a future refactor cannot turn this into a crash.
-            Ok(p) => p,
-            Err(_) => return Err(OriginError::PoolClosed),
-        };
+        let permit = self.acquire().await?;
         let resp = self.client.request(req).await.map_err(OriginError::Hyper)?;
         Ok((resp, permit))
     }
@@ -87,25 +95,53 @@ pub struct ProbeSnapshot {
     pub vary_ua: Option<String>,
 }
 
-/// Keyed by absolute URI plus fingerprints of the headers that change the
-/// representation for authenticated origins, so one user's cached length
-/// never serves another's session — without retaining their secrets.
-pub fn cache_key(uri: &Uri, auth: Option<&HeaderValue>, cookie: Option<&HeaderValue>) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    fn fingerprint(v: &HeaderValue) -> String {
-        let mut h = DefaultHasher::new();
-        v.as_bytes().hash(&mut h);
-        format!("{:016x}", h.finish())
+impl ProbeSnapshot {
+    /// Age of a probe snapshot for HTTP freshness calculations.
+    pub fn age(&self) -> Duration {
+        self.probed_at.elapsed()
     }
-    let uri = uri.to_string();
-    let mut key = String::with_capacity(uri.len() + 64);
-    key.push_str(&uri);
-    key.push('|');
-    key.push_str(&auth.map(fingerprint).unwrap_or_default());
-    key.push('|');
-    key.push_str(&cookie.map(fingerprint).unwrap_or_default());
+}
+
+/// Build an opaque cache key from the full URI and every repeated
+/// `Authorization`, `Cookie`, and `User-Agent` value, in header order.
+///
+/// The SHA-256 digest prevents session credentials (including credentials
+/// embedded in a URI) from being retained in the cache's keys.
+pub fn cache_key(uri: &Uri, headers: &HeaderMap) -> String {
+    fn update_framed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"segregate/probe-cache/v1\0");
+    update_framed(&mut hasher, uri.to_string().as_bytes());
+    for name in [
+        http::header::AUTHORIZATION,
+        http::header::COOKIE,
+        http::header::USER_AGENT,
+    ] {
+        let values = headers.get_all(name);
+        hasher.update((values.iter().count() as u64).to_be_bytes());
+        for value in values {
+            update_framed(&mut hasher, value.as_bytes());
+        }
+    }
+
+    let digest = hasher.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        key.push(char::from(HEX[(byte >> 4) as usize]));
+        key.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
     key
+}
+
+#[derive(Debug)]
+struct InflightProbe {
+    generation: Arc<()>,
+    sender: Weak<tokio::sync::watch::Sender<Option<ProbeSnapshot>>>,
 }
 
 struct CachedProbe {
@@ -131,11 +167,10 @@ pub struct ProbeCache {
     ttl: Duration,
     max_entries: usize,
     inner: RwLock<HashMap<String, CachedProbe>>,
-    /// In-flight probes for stampede protection: concurrent downloads of
-    /// the same uncached URL share one origin probe instead of each
-    /// firing their own.
-    inflight:
-        tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<ProbeSnapshot>>>>,
+    /// In-flight probes for stampede protection. The weak sender lets a
+    /// cancelled leader's slot be pruned without keeping its watch channel
+    /// alive; the map never exceeds `max_entries`.
+    inflight: tokio::sync::Mutex<HashMap<String, InflightProbe>>,
 }
 
 impl ProbeCache {
@@ -206,11 +241,20 @@ impl ProbeCache {
         self.write_inner().remove(key);
     }
 
-    /// Cached hit, or run `probe` exactly once across concurrent tasks for
-    /// this key and share its outcome. `wait_budget` bounds how long a
-    /// follower waits for the leader; past it — or if the leader is gone
-    /// (its sender drops on panic) — the follower cleans the slot and
-    /// probes on its own. Degraded, never hung.
+    async fn remove_inflight_generation(&self, key: &str, generation: &Arc<()>) {
+        let mut inflight = self.inflight.lock().await;
+        if inflight
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.generation, generation))
+        {
+            inflight.remove(key);
+        }
+    }
+
+    /// Cached hit, or run `probe` once across concurrent tasks for this key
+    /// and share its outcome. `wait_budget` bounds follower wait time. A
+    /// timed-out follower probes independently, and cleanup is generation-
+    /// checked so a late leader can never remove a newer probe's slot.
     pub async fn get_or_probe<F, Fut>(
         &self,
         key: &str,
@@ -228,9 +272,18 @@ impl ProbeCache {
             return Some(hit);
         }
         enum Role<F> {
-            Leader(tokio::sync::watch::Sender<Option<ProbeSnapshot>>, Option<F>),
-            Follower(tokio::sync::watch::Receiver<Option<ProbeSnapshot>>),
+            Leader {
+                generation: Arc<()>,
+                sender: Arc<tokio::sync::watch::Sender<Option<ProbeSnapshot>>>,
+                run: F,
+            },
+            Follower {
+                generation: Arc<()>,
+                result: tokio::sync::watch::Receiver<Option<ProbeSnapshot>>,
+            },
+            Standalone(F),
         }
+
         let mut run = Some(run);
         let role = {
             let mut inflight = self.inflight.lock().await;
@@ -238,51 +291,87 @@ impl ProbeCache {
             if let Some(hit) = self.get(key) {
                 return Some(hit);
             }
-            match inflight.get(key) {
-                Some(rx) => Role::Follower(rx.clone()),
-                None => {
-                    let (tx, rx) = tokio::sync::watch::channel(None);
-                    inflight.insert(key.to_owned(), rx);
-                    Role::Leader(tx, run.take())
+
+            // Leaders own the only strong sender. Weak entries left by task
+            // cancellation/panic carry no live probe and are safe to prune.
+            inflight.retain(|_, entry| entry.sender.upgrade().is_some());
+            let follower = inflight.get(key).and_then(|entry| {
+                entry
+                    .sender
+                    .upgrade()
+                    .map(|sender| (entry.generation.clone(), sender.subscribe()))
+            });
+            if let Some((generation, result)) = follower {
+                Role::Follower { generation, result }
+            } else {
+                inflight.remove(key);
+                if inflight.len() >= self.max_entries {
+                    // Never evict a live generation. Bounded memory wins over
+                    // stampede sharing; this request still probes normally.
+                    let run = run.take()?;
+                    Role::Standalone(run)
+                } else {
+                    let run = run.take()?;
+                    let generation = Arc::new(());
+                    let (sender, _result) = tokio::sync::watch::channel(None);
+                    let sender = Arc::new(sender);
+                    inflight.insert(
+                        key.to_owned(),
+                        InflightProbe {
+                            generation: generation.clone(),
+                            sender: Arc::downgrade(&sender),
+                        },
+                    );
+                    Role::Leader {
+                        generation,
+                        sender,
+                        run,
+                    }
                 }
             }
         };
+
         match role {
-            Role::Follower(mut rx) => {
+            Role::Follower {
+                generation,
+                mut result,
+            } => {
                 let updated = matches!(
-                    tokio::time::timeout(wait_budget, rx.wait_for(|v| v.is_some())).await,
+                    tokio::time::timeout(wait_budget, result.wait_for(|value| value.is_some()))
+                        .await,
                     Ok(Ok(_))
                 );
                 if updated {
-                    return rx.borrow().clone();
+                    return result.borrow().clone();
                 }
-                self.inflight.lock().await.remove(key);
+                self.remove_inflight_generation(key, &generation).await;
                 match run {
-                    Some(r) => r().await,
-                    // Unreachable: only the Leader arm takes `run`.
-                    // Fall back to a miss rather than panic.
+                    Some(run) => run().await,
                     None => None,
                 }
             }
-            Role::Leader(tx, run) => {
-                // Unreachable in the `None` case (only this arm takes `run`);
-                // a miss degrades to passthrough downstream, never a panic.
-                let res = match run {
-                    Some(r) => r().await,
-                    None => None,
-                };
-                let _ = tx.send(res.clone());
-                // Slot served its purpose; late arrivals use the cache or
-                // elect a fresh leader.
-                self.inflight.lock().await.remove(key);
-                res
+            Role::Leader {
+                generation,
+                sender,
+                run,
+            } => {
+                let result = run().await;
+                let _ = sender.send(result.clone());
+                self.remove_inflight_generation(key, &generation).await;
+                result
             }
+            Role::Standalone(run) => run().await,
         }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
         self.read_inner().len()
+    }
+
+    #[cfg(test)]
+    async fn inflight_len(&self) -> usize {
+        self.inflight.lock().await.len()
     }
 }
 
@@ -351,6 +440,7 @@ pub fn parse_connect_ports(s: &str) -> Result<HashSet<u16>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderValue;
 
     #[test]
     fn parses_port_allowlist() {
@@ -362,30 +452,71 @@ mod tests {
     }
 
     #[test]
-    fn cache_keys_separate_sessions() {
+    fn cache_keys_separate_sessions_and_user_agents() {
         let uri: Uri = "https://h/file".parse().unwrap();
-        let a = HeaderValue::from_static("a");
-        let b = HeaderValue::from_static("b");
-        assert_ne!(
-            cache_key(&uri, Some(&a), None),
-            cache_key(&uri, Some(&b), None)
+        let mut auth_a = HeaderMap::new();
+        auth_a.append(http::header::AUTHORIZATION, HeaderValue::from_static("a"));
+        let mut auth_b = HeaderMap::new();
+        auth_b.append(http::header::AUTHORIZATION, HeaderValue::from_static("b"));
+        assert_ne!(cache_key(&uri, &auth_a), cache_key(&uri, &auth_b));
+
+        let mut ua_a = HeaderMap::new();
+        ua_a.append(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("agent-a"),
         );
-        assert_eq!(cache_key(&uri, None, None), cache_key(&uri, None, None));
+        let mut ua_b = HeaderMap::new();
+        ua_b.append(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("agent-b"),
+        );
+        assert_ne!(cache_key(&uri, &ua_a), cache_key(&uri, &ua_b));
+
+        let empty = HeaderMap::new();
+        assert_eq!(cache_key(&uri, &empty), cache_key(&uri, &empty));
+        let other_uri: Uri = "https://h/other".parse().unwrap();
+        assert_ne!(cache_key(&uri, &empty), cache_key(&other_uri, &empty));
+    }
+
+    #[test]
+    fn cache_keys_include_repeated_header_values() {
+        let uri: Uri = "https://h/file".parse().unwrap();
+        let mut first = HeaderMap::new();
+        first.append(http::header::COOKIE, HeaderValue::from_static("a=1"));
+        first.append(http::header::COOKIE, HeaderValue::from_static("b=2"));
+        let mut second = HeaderMap::new();
+        second.append(http::header::COOKIE, HeaderValue::from_static("a=1"));
+        let mut reversed = HeaderMap::new();
+        reversed.append(http::header::COOKIE, HeaderValue::from_static("b=2"));
+        reversed.append(http::header::COOKIE, HeaderValue::from_static("a=1"));
+        assert_ne!(cache_key(&uri, &first), cache_key(&uri, &second));
+        assert_ne!(cache_key(&uri, &first), cache_key(&uri, &reversed));
     }
 
     #[test]
     fn cache_keys_do_not_retain_secrets() {
-        let uri: Uri = "https://h/file".parse().unwrap();
-        let secret = HeaderValue::from_static("super-secret-token");
-        let key = cache_key(&uri, Some(&secret), Some(&secret));
+        let uri: Uri = "https://h/file?token=uri-secret-token".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("super-secret-token"),
+        );
+        headers.append(
+            http::header::COOKIE,
+            HeaderValue::from_static("cookie-secret"),
+        );
+        let key = cache_key(&uri, &headers);
+        assert_eq!(key.len(), 64);
+        assert!(!key.contains("uri-secret-token"));
         assert!(!key.contains("super-secret-token"));
+        assert!(!key.contains("cookie-secret"));
     }
 
     #[test]
     fn cache_put_get_invalidate() {
         let cache = ProbeCache::new(60, 8);
         let uri: Uri = "https://h/f".parse().unwrap();
-        let key = cache_key(&uri, None, None);
+        let key = cache_key(&uri, &HeaderMap::new());
         assert!(cache.get(&key).is_none());
         cache.put(
             key.clone(),
@@ -399,6 +530,7 @@ mod tests {
         );
         let hit = cache.get(&key).unwrap();
         assert_eq!((hit.total, hit.range_ok), (42, true));
+        assert!(hit.age() <= Duration::from_secs(1));
         cache.invalidate(&key);
         assert!(cache.get(&key).is_none());
     }
@@ -409,7 +541,7 @@ mod tests {
         for i in 0..4 {
             let uri: Uri = format!("https://h/f{i}").parse().unwrap();
             cache.put(
-                cache_key(&uri, None, None),
+                cache_key(&uri, &HeaderMap::new()),
                 ProbeSnapshot {
                     total: i,
                     range_ok: true,
@@ -434,7 +566,7 @@ mod tests {
             panic!("intentional poison");
         });
         assert!(handle.join().is_err());
-        let key = cache_key(&"https://h/f".parse().unwrap(), None, None);
+        let key = cache_key(&"https://h/f".parse().unwrap(), &HeaderMap::new());
         cache.put(
             key.clone(),
             ProbeSnapshot {
@@ -525,6 +657,128 @@ mod tests {
         assert_eq!(res.unwrap().total, 9);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         leader.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_leader_cleanup_cannot_remove_new_generation() {
+        use tokio::sync::Notify;
+
+        let cache = Arc::new(ProbeCache::new(60, 8));
+        let old_started = Arc::new(Notify::new());
+        let release_old = Arc::new(Notify::new());
+        let old = tokio::spawn({
+            let cache = cache.clone();
+            let old_started = old_started.clone();
+            let release_old = release_old.clone();
+            async move {
+                cache
+                    .get_or_probe("same-key", Duration::from_secs(5), || async move {
+                        old_started.notify_one();
+                        release_old.notified().await;
+                        Some(ProbeSnapshot {
+                            total: 1,
+                            range_ok: true,
+                            headers: HeaderMap::new(),
+                            probed_at: Instant::now(),
+                            vary_ua: None,
+                        })
+                    })
+                    .await
+            }
+        });
+        old_started.notified().await;
+
+        // This follower removes generation 1 after its budget, while the old
+        // leader is deliberately kept alive.
+        let follower = cache
+            .get_or_probe("same-key", Duration::from_millis(10), || async {
+                Some(ProbeSnapshot {
+                    total: 2,
+                    range_ok: true,
+                    headers: HeaderMap::new(),
+                    probed_at: Instant::now(),
+                    vary_ua: None,
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(follower.total, 2);
+
+        let new_started = Arc::new(Notify::new());
+        let release_new = Arc::new(Notify::new());
+        let new = tokio::spawn({
+            let cache = cache.clone();
+            let new_started = new_started.clone();
+            let release_new = release_new.clone();
+            async move {
+                cache
+                    .get_or_probe("same-key", Duration::from_secs(5), || async move {
+                        new_started.notify_one();
+                        release_new.notified().await;
+                        Some(ProbeSnapshot {
+                            total: 3,
+                            range_ok: true,
+                            headers: HeaderMap::new(),
+                            probed_at: Instant::now(),
+                            vary_ua: None,
+                        })
+                    })
+                    .await
+            }
+        });
+        new_started.notified().await;
+
+        release_old.notify_one();
+        assert_eq!(old.await.unwrap().unwrap().total, 1);
+        assert_eq!(
+            cache.inflight_len().await,
+            1,
+            "old generation removed the new slot"
+        );
+
+        release_new.notify_one();
+        assert_eq!(new.await.unwrap().unwrap().total, 3);
+        assert_eq!(cache.inflight_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn inflight_map_is_bounded_without_evicting_live_probes() {
+        use tokio::sync::Notify;
+
+        let cache = Arc::new(ProbeCache::new(60, 1));
+        let started = Arc::new(Notify::new());
+        let leader = tokio::spawn({
+            let cache = cache.clone();
+            let started = started.clone();
+            async move {
+                cache
+                    .get_or_probe("first", Duration::from_secs(5), || async move {
+                        started.notify_one();
+                        std::future::pending::<()>().await;
+                        None
+                    })
+                    .await
+            }
+        });
+        started.notified().await;
+
+        let standalone = cache
+            .get_or_probe("second", Duration::from_millis(10), || async {
+                Some(ProbeSnapshot {
+                    total: 9,
+                    range_ok: true,
+                    headers: HeaderMap::new(),
+                    probed_at: Instant::now(),
+                    vary_ua: None,
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(standalone.total, 9);
+        assert_eq!(cache.inflight_len().await, 1);
+
+        leader.abort();
+        let _ = leader.await;
     }
 
     #[test]

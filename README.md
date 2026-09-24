@@ -14,8 +14,8 @@ cargo run --release -- --listen 127.0.0.1:8080 --workers 8 --ca-out mitm-ca.pem
 ## Use
 
 ```bash
-# HTTPS via MITM. Either trust the CA once ...
-REQUESTS_CA_BUNDLE=./mitm-ca.pem curl --proxy http://127.0.0.1:8080 https://example.com/file
+# HTTPS via MITM. Trust the CA for this curl (the CA is per proxy run) ...
+curl --cacert ./mitm-ca.pem --proxy http://127.0.0.1:8080 https://example.com/file
 # ... or skip verification (per-host leaf certs, no cache/files)
 curl -k --proxy http://127.0.0.1:8080 https://example.com/file
 
@@ -44,21 +44,26 @@ cargo run --release -- --tunnel-only
 - `--max-slice-retries N` (default 30, alias `--max-part-retries`):
   consecutive origin failures per slice before truncating so the client
   resumes with Range instead of hanging forever on a dead origin.
-- `--body-buffer N` (default 16): bounded downstream channel depth.
+- `--body-buffer N` (default 16): maximum downstream frame depth; the
+  effective depth is also capped by a 16 MiB byte budget.
 - `--no-hedge`: disable hedged duplicate requests for stalled segments.
 - `--tunnel-only`: skip MITM, relay CONNECT as TCP.
 - `--ca-out PATH`: write the run's MITM CA certificate (PEM) for clients
-  to trust.
-- `--max-downloads N` (default 16): concurrent downstream downloads;
+  to trust. The CA is ephemeral and changes on every proxy start.
+- `--max-connections N` (default 1024): maximum downstream TCP connections,
+  including keep-alive connections.
+- `--max-tunnels N` (default 64): maximum concurrent CONNECT tunnels/MITM
+  sessions.
+- `--max-downloads N` (default 16): concurrent downstream response bodies;
   excess gets `503` + `Retry-After` instead of queueing unboundedly.
 - `--max-origin-connections N` (default 64): total concurrent origin
-  exchanges (probe/segments/hedge/passthrough), permits held for the whole
-  body lifetime.
+  exchanges and raw CONNECT sockets, including probe/segment/hedge/passthrough.
 - `--header-timeout-secs S` (default 10, 0 disables): max time to receive
   downstream request headers before closing (slow-loris bound).
 - `--probe-cache-ttl-secs S` (default 60, 0 disables), `--probe-cache-entries N`
-  (default 1024): cache probe results keyed by URI + auth/cookie, so
-  retries and resumes skip the probe RTT; invalidated on 416.
+  (default 1024): cache only safe probe metadata, keyed by a SHA-256
+  fingerprint of URI + all auth/cookie/user-agent values, so retries and
+  resumes skip the probe RTT; invalidated on 416.
 - `--origin-ca-bundle PATH`: extra CA bundle (PEM) trusted for *origin*
   TLS verification, for self-signed/corporate origins. Unrelated to
   `--ca-out`, which exports the MITM CA.
@@ -82,12 +87,14 @@ absurd values fail safe instead of exhausting tasks, channels, or memory.
 `GET /__stats` (origin-form, proxy itself only) returns JSON counters:
 `downloads`, `bytes_out`, `buffered_bytes` (completed-but-unflushed slice
 bytes currently held), `origin_retries`, `hedges`, `truncations`,
-`cache_hits`, `refused` (CONNECT-denied + 503-overload), `uptime_secs`.
+`cache_hits`, `refused` (CONNECT-denied + 503-overload),
+`connect_errors`, `uptime_secs`.
 
 ## Status codes (and what clients should do)
 
 - `200` / `206`: full / partial body, byte-exact for the requested range.
-- `304`: downstream `If-None-Match` matched the origin ETag — no fetch.
+- `304`: returned only when the origin evaluates the client's complete
+  conditional request; probe metadata is never used to synthesize freshness.
 - `400`: malformed proxy request (bad `/__fetch` URL, origin-form
   non-proxy request that isn't `/__stats`).
 - `403`: CONNECT port outside `--allow-connect-ports`, answered before
@@ -99,8 +106,8 @@ bytes currently held), `origin_retries`, `hedges`, `truncations`,
   re-probes).
 - `502`: origin unreachable / TLS failed / probe failed and no cached
   entry. Retryable.
-- `503` + `Retry-After: 5`: at `--max-downloads` capacity. Back off and
-  retry; never a hung socket.
+- `503` + `Retry-After: 5`: at `--max-downloads` or `--max-tunnels`
+  capacity. Back off and retry; never a hung socket.
 - Truncated `200` (short body vs `Content-Length`): origin died mid-stream
   after headers. Resume with `Range` (e.g. `curl -C -`, `wget -c`), which
   the proxy serves from cache without re-probing.
@@ -111,8 +118,8 @@ This is an intercepting forward proxy: anyone who can reach the listener
 and trusts (or ignores) the MITM CA gets their traffic decrypted. The
 default bind is loopback — keep it that way. Binding `0.0.0.0` exposes an
 open proxy that MITMs whoever points at it; only do that on a trusted
-network you control, and prefer `--ca-out` + client trust over
-`--no-check-certificate`.
+network you control, and prefer `--ca-out` plus client trust over skipping
+certificate verification.
 
 ## Client pairing
 
@@ -129,31 +136,33 @@ wget -e use_proxy=yes -e http_proxy=127.0.0.1:8080 --timeout=30 --tries=10 http:
 
 1. `Range: bytes=0-0` probe learns length + range support (retried 3x,
    result cached and shared across concurrent downloads of the same URL).
-   A matching downstream `If-None-Match` short-circuits to `304` without
-   fetching. The body is never buffered unboundedly: 206 probe bodies are
-   drained bounded (16 B); anything else drops the body unread.
-   Segment sub-requests fetch `identity` (no `Accept-Encoding`) so
-   compressible assets stay rangeable; conditional headers are stripped
-   after the probe validates freshness.
-2. Range-capable files are striped into `--slice-bytes` slices; N workers
-   pull slice indices past a bounded completion window (no locks: an atomic
-   cursor plus a watch channel), each slice streaming from the origin on
-   its own connection with timeout + resume-from-offset retry (gives up
-   after `--max-slice-retries` consecutive failures without progress; 416
-   invalidates the cache entry; 4xx stops immediately). An origin that
-   answers `200` to a Range request is streamed with a skip-to-offset
-   instead of failing. Files below `--min-segment` use one connection.
+   Conditional requests (`If-Match`, `If-None-Match`, `If-Range`, and date
+   validators) are sent to the origin as a complete single-request
+   exchange rather than answered from cached metadata. Probe bodies are
+   never buffered unboundedly: 206 probe bodies are drained bounded; full
+   200 bodies are dropped unread. Session cookies are never placed in the
+   shared probe snapshot.
+2. A first real range is checked before fan-out. If the origin ignores
+   Range, the proxy switches to one linear full-body response instead of
+   downloading and discarding a growing prefix for every slice. Otherwise
+   range-capable files with a strong validator are striped into
+   `--slice-bytes` slices; N workers pull indices past a bounded completion
+   window (no coordinator lock), each with timeout + resume-from-offset
+   retry. `Content-Range` and validators must match every slice; a mismatch
+   invalidates the metadata and safely truncates for client resume. Files
+   below `--min-segment`, or without a safe validator, use one connection.
 3. A slice that goes idle mid-body races one bounded duplicate request
    (headers + first chunk only) against the stalled connection and keeps
    whichever delivers first.
 4. Origin chunks are truncated to the requested window so a buggy origin
    can never corrupt downstream `Content-Length` framing.
 5. A coordinator flushes completed slices strictly in order into the
-   downstream body, whose depth is derived from a byte budget (one frame
-   can hold a whole slice). Retention is bounded by ~(window + workers) ×
-   slice size no matter the file size — first bytes flush as soon as the
-   first slice completes, and `buffered_bytes` in `/__stats` shows the live
-   held total.
+   downstream body. Slices are never silently enlarged: ranges that would
+   exceed one million descriptors fall back to one full response. Retention
+   is bounded by `(window + body-depth) × slice_bytes`; startup validation
+   keeps the aggregate downstream budget near 1 GiB. `buffered_bytes` in
+   `/__stats` shows completed-but-unflushed bytes, while active worker
+   buffers are bounded separately by the validated configuration.
 6. Downstream always sees valid HTTP framing: transport errors become
    502, stalls truncate (resumable via `Range`, incl. suffix ranges
    `bytes=-N`), never a dropped socket. Single-connection passthrough
@@ -166,7 +175,8 @@ wget -e use_proxy=yes -e http_proxy=127.0.0.1:8080 --timeout=30 --tries=10 http:
 8. Sharing is lock-free except the probe cache (short `std` lock, never
    held across `.await`): `Clone` handles the libraries already refcount
    internally (`hyper` client, `Bytes` chunks), one immutable `Arc` for
-   the CA, plus two semaphores for the global caps.
+   the CA, and semaphores for connection, tunnel, download, and origin
+   caps.
 9. Origin connections are HTTP/1.1 only: segmentation needs one TCP
    connection per segment (HTTP/2 would multiplex everything onto one),
    and plain HTTP/1.1 is accepted by the pickiest WAFs.

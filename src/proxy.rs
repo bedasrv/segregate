@@ -6,6 +6,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use tokio::sync::OwnedSemaphorePermit;
+use tokio_util::sync::CancellationToken;
 
 use tracing::Instrument;
 
@@ -60,7 +61,13 @@ fn fetch_query_target(path_and_query: &str) -> Option<Uri> {
             // Same privilege as the forward proxy, but refuse non-HTTP
             // schemes outright (no file://, gopher://, ...).
             match target.scheme_str() {
-                Some("http") | Some("https") => return Some(target),
+                Some("http") | Some("https")
+                    if !target
+                        .authority()
+                        .is_some_and(|authority| authority.as_str().contains('@')) =>
+                {
+                    return Some(target);
+                }
                 _ => return None,
             }
         }
@@ -101,6 +108,10 @@ fn bad_request() -> Response<BoxBody> {
 fn method_not_allowed() -> Response<BoxBody> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(
+            http::header::ALLOW,
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+        )
         .body(segment::empty_body())
         .unwrap()
 }
@@ -154,8 +165,12 @@ pub async fn handle(
         if parsed.host().is_empty() || raw.contains('@') {
             return Ok(bad_request());
         }
-        let authority = parsed.to_string();
         let port: u16 = parsed.port_u16().unwrap_or(443);
+        let authority = if parsed.port_u16().is_some() {
+            parsed.to_string()
+        } else {
+            format!("{parsed}:{port}")
+        };
         if !shared.allowed_ports.contains(&port) {
             let n = shared.metrics.refused.fetch_add(1, Ordering::Relaxed) + 1;
             if crate::state::sample_hit(n, 100) {
@@ -167,11 +182,8 @@ pub async fn handle(
             }
             return Ok(forbidden());
         }
-        // Bound CONNECT handling like any other download: the permit is
-        // held for the whole tunnel/MITM lifetime, so raw-TCP tunnels
-        // cannot bypass the global cap either. Refusals answer 503 here,
-        // before the upgrade — never a hung CONNECT.
-        let Ok(conn_permit) = shared.downloads.clone().try_acquire_owned() else {
+        // Bound CONNECT sessions independently from active downloads.
+        let Ok(tunnel_permit) = shared.tunnels.clone().try_acquire_owned() else {
             shared.metrics.refused.fetch_add(1, Ordering::Relaxed);
             return Ok(overloaded());
         };
@@ -180,7 +192,9 @@ pub async fn handle(
             tracing::debug_span!("connect", req_id, authority = %redact_authority(&authority));
         // `hyper::upgrade::on` takes the whole request; spawn so we can
         // answer 200 immediately and work on the upgraded stream.
-        tokio::spawn(connect_task(req, shared, authority, port, conn_permit).instrument(span));
+        shared.upgrades.spawn(
+            connect_task(req, shared.clone(), authority, port, tunnel_permit).instrument(span),
+        );
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .body(segment::empty_body())
@@ -204,16 +218,20 @@ pub async fn handle(
     }
 
     // Reverse-proxy helper: `GET http://127.0.0.1:8080/__fetch?url=<https://...>`
-    // No CONNECT, no certs. Useful when `--no-check-certificate` is unwanted.
-    if parts.method == Method::GET && uri.path() == "/__fetch" {
+    // No CONNECT, no certs. Useful when client certificate verification is
+    // inconvenient.
+    if parts.method == Method::GET && uri.scheme().is_none() && uri.path() == "/__fetch" {
         if let Some(target) = uri
             .path_and_query()
             .map(|pq| pq.as_str())
             .and_then(fetch_query_target)
         {
+            if segment::has_ambiguous_framing(&parts.headers) {
+                return Ok(bad_request());
+            }
             // Global download cap: fail fast with a retryable 503 rather
             // than queueing unboundedly.
-            let Ok(_permit) = shared.downloads.clone().try_acquire_owned() else {
+            let Ok(permit) = shared.downloads.clone().try_acquire_owned() else {
                 shared.metrics.refused.fetch_add(1, Ordering::Relaxed);
                 return Ok(overloaded());
             };
@@ -222,16 +240,33 @@ pub async fn handle(
                 tracing::debug_span!("download", req_id, target = %segment::redact_uri(&target));
             let range = parts.headers.get(http::header::RANGE).cloned();
             drain_get_body(body, &shared);
-            return Ok(segment::serve_get(shared, target, parts.headers, range)
-                .instrument(span)
-                .await);
+            let cancel = CancellationToken::new();
+            let response = segment::serve_get_with_cancel(
+                shared,
+                target,
+                parts.headers,
+                range,
+                cancel.clone(),
+            )
+            .instrument(span)
+            .await;
+            return Ok(segment::guard_response(response, permit, cancel));
         }
         return Ok(bad_request());
     }
 
     if uri.scheme().is_some() {
+        if uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
+        {
+            return Ok(bad_request());
+        }
         // Forward-proxy absolute-form: `GET http://host/path`.
-        let Ok(_permit) = shared.downloads.clone().try_acquire_owned() else {
+        if segment::has_ambiguous_framing(&parts.headers) {
+            return Ok(bad_request());
+        }
+        let Ok(permit) = shared.downloads.clone().try_acquire_owned() else {
             shared.metrics.refused.fetch_add(1, Ordering::Relaxed);
             return Ok(overloaded());
         };
@@ -240,12 +275,20 @@ pub async fn handle(
             let span = tracing::debug_span!("download", req_id, target = %segment::redact_uri(&uri), method = "GET");
             let range = parts.headers.get(http::header::RANGE).cloned();
             drain_get_body(body, &shared);
-            return Ok(segment::serve_get(shared, uri, parts.headers, range)
-                .instrument(span)
-                .await);
+            let cancel = CancellationToken::new();
+            let response =
+                segment::serve_get_with_cancel(shared, uri, parts.headers, range, cancel.clone())
+                    .instrument(span)
+                    .await;
+            return Ok(segment::guard_response(response, permit, cancel));
         }
         let headers = segment::passthrough_headers(&parts.headers);
-        return Ok(segment::serve_other(shared, parts.method, uri, headers, body.boxed()).await);
+        let response = segment::serve_other(shared, parts.method, uri, headers, body.boxed()).await;
+        return Ok(segment::guard_response(
+            response,
+            permit,
+            CancellationToken::new(),
+        ));
     }
 
     Ok(bad_request())
@@ -312,6 +355,10 @@ async fn tunnel(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "CONNECT upgrade timeout"))?
         .map_err(std::io::Error::other)?;
     let mut up = TokioIo::new(upgraded);
+    let _origin_permit = tokio::time::timeout(connect_timeout(shared), shared.origin.acquire())
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "origin permit timeout"))?
+        .map_err(|error| std::io::Error::other(format!("origin permit: {error:?}")))?;
     let mut origin = tokio::time::timeout(
         connect_timeout(shared),
         tokio::net::TcpStream::connect(authority),
@@ -337,7 +384,8 @@ async fn mitm(
     use tokio_rustls::TlsAcceptor;
 
     let parsed: http::uri::Authority = authority.parse()?;
-    let (_uri_host, cert_host, _port, scheme) = split_authority(&parsed);
+    let (_uri_host, cert_host, _port, _scheme) = split_authority(&parsed);
+    let scheme = "https";
     let upgraded = tokio::time::timeout(connect_timeout(&shared), hyper::upgrade::on(req))
         .await
         .map_err(|_| {
@@ -346,7 +394,7 @@ async fn mitm(
     let tls_cfg = ca
         .leaf_config(&cert_host)
         .map_err(|e| std::io::Error::other(format!("cert: {e}")))?;
-    let acceptor = TlsAcceptor::from(std::sync::Arc::new(tls_cfg));
+    let acceptor = TlsAcceptor::from(tls_cfg);
     let tls = tokio::time::timeout(
         connect_timeout(&shared),
         acceptor.accept(TokioIo::new(upgraded)),
@@ -379,20 +427,42 @@ async fn mitm(
                     return Ok::<_, std::convert::Infallible>(bad_request());
                 }
             };
-            // The outer CONNECT holds the download permit for the whole
-            // connection lifetime, so inner requests skip the per-request
-            // cap instead of double-counting.
+            // Inner requests get their own body-lifetime permit. The outer
+            // CONNECT still bounds the number of TLS connections.
             if parts.method == Method::GET {
+                let Ok(permit) = shared.downloads.clone().try_acquire_owned() else {
+                    return Ok::<_, std::convert::Infallible>(overloaded());
+                };
                 let req_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
                 let span = tracing::debug_span!("download", req_id, target = %segment::redact_uri(&target), method = "GET");
                 let range = parts.headers.get(http::header::RANGE).cloned();
                 drain_get_body(body, &shared);
-                Ok(segment::serve_get(shared, target, parts.headers, range)
-                    .instrument(span)
-                    .await)
+                let cancel = CancellationToken::new();
+                let response = segment::serve_get_with_cancel(
+                    shared,
+                    target,
+                    parts.headers,
+                    range,
+                    cancel.clone(),
+                )
+                .instrument(span)
+                .await;
+                Ok(segment::guard_response(response, permit, cancel))
             } else {
+                if segment::has_ambiguous_framing(&parts.headers) {
+                    return Ok::<_, std::convert::Infallible>(bad_request());
+                }
+                let Ok(permit) = shared.downloads.clone().try_acquire_owned() else {
+                    return Ok::<_, std::convert::Infallible>(overloaded());
+                };
                 let headers = segment::passthrough_headers(&parts.headers);
-                Ok(segment::serve_other(shared, parts.method, target, headers, body.boxed()).await)
+                let response =
+                    segment::serve_other(shared, parts.method, target, headers, body.boxed()).await;
+                Ok(segment::guard_response(
+                    response,
+                    permit,
+                    CancellationToken::new(),
+                ))
             }
         }
     });
@@ -462,6 +532,8 @@ mod tests {
                 no_hedge: true,
                 tunnel_only: false,
                 ca_out: None,
+                max_connections: 32,
+                max_tunnels: 8,
                 max_downloads: 4,
                 max_origin_connections: 8,
                 header_timeout_secs: 5,
@@ -476,6 +548,9 @@ mod tests {
             origin: Origin::new(build_client(None, 8).unwrap(), 8),
             ca: None,
             downloads: Arc::new(Semaphore::new(4)),
+            connections: Arc::new(Semaphore::new(32)),
+            tunnels: Arc::new(Semaphore::new(8)),
+            upgrades: Arc::new(tokio_util::task::TaskTracker::new()),
             allowed_ports: Arc::new(ports.clone()),
             mitm_ports: Arc::new(ports),
             metrics: Arc::new(Metrics::default()),
@@ -567,6 +642,52 @@ mod tests {
         let n = raw.read(&mut buf).await.unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 403"));
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn absolute_fetch_path_is_forwarded_not_hijacked() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        tokio::spawn(async move {
+            use hyper_util::rt::TokioIo;
+            loop {
+                let Ok((stream, _)) = origin.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(
+                        |req: Request<hyper::body::Incoming>| async move {
+                            let path = req.uri().path().to_owned();
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(http::header::CONTENT_LENGTH, path.len())
+                                    .body(http_body_util::Full::new(Bytes::from(path)))
+                                    .unwrap(),
+                            )
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        let (addr, server) = serve_on(test_shared()).await;
+        let target = format!("http://{origin_addr}/__fetch?url=http://{origin_addr}/real");
+        let mut raw = tokio::net::TcpStream::connect(addr).await.unwrap();
+        raw.write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: {origin_addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = String::new();
+        raw.read_to_string(&mut response).await.unwrap();
+        assert!(response.contains("/__fetch"), "{response}");
+        assert!(!response.contains("/real"), "{response}");
         server.abort();
     }
 
@@ -716,7 +837,7 @@ mod tests {
         let srv_tls = origin_ca.leaf_config("127.0.0.1").unwrap();
         let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_addr = origin.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(srv_tls));
+        let acceptor = tokio_rustls::TlsAcceptor::from(srv_tls);
         tokio::spawn(async move {
             use hyper_util::rt::TokioIo;
             loop {

@@ -54,11 +54,21 @@ pub struct Config {
     pub tunnel_only: bool,
 
     /// Write the generated MITM CA certificate (PEM) here so clients can
-    /// trust it instead of using --no-check-certificate
+    /// trust it instead of disabling certificate verification
     #[arg(long)]
     pub ca_out: Option<PathBuf>,
 
+    /// Maximum concurrent downstream TCP connections, including HTTP
+    /// keep-alive connections and long-lived CONNECT tunnels
+    #[arg(long, default_value_t = 1024)]
+    pub max_connections: usize,
+
+    /// Maximum concurrent CONNECT tunnels/MITM sessions
+    #[arg(long, default_value_t = 64)]
+    pub max_tunnels: usize,
+
     /// Concurrent downstream downloads; excess gets 503 + Retry-After
+    /// before any origin work
     #[arg(long, default_value_t = 16)]
     pub max_downloads: usize,
 
@@ -119,6 +129,10 @@ impl Config {
                 tracing::warn!(%name, from = %orig, to = %*v, "clamped to sane range");
             }
         }
+        const MAX_WORKER_RETENTION: u64 = 256 << 20;
+        const DOWNSTREAM_QUEUE_RETENTION: u64 = 16 << 20;
+        const MAX_TOTAL_DOWNSTREAM_RETENTION: u64 = 1 << 30;
+
         clamp(&mut self.workers, 1, 128, "workers");
         clamp(&mut self.min_segment, 1, 1 << 40, "min_segment");
         clamp(&mut self.timeout_secs, 1, 300, "timeout_secs");
@@ -129,13 +143,32 @@ impl Config {
             "connect_timeout_secs",
         );
         clamp(&mut self.max_slice_retries, 1, 100_000, "max_slice_retries");
-        clamp(&mut self.slice_bytes, 1024, 1 << 30, "slice_bytes");
-        clamp(&mut self.body_buffer, 1, 4096, "body_buffer");
-        clamp(&mut self.max_downloads, 1, 100_000, "max_downloads");
+
+        // Every worker can hold an assembled slice plus a hedge even if
+        // downstream stops reading, so cap that retention before the
+        // aggregate download cap.
+        let retention_slices = (self.workers as u64) * if self.no_hedge { 1 } else { 2 };
+        let max_slice_bytes = (MAX_WORKER_RETENTION / retention_slices).max(1024);
+        clamp(&mut self.slice_bytes, 1024, max_slice_bytes, "slice_bytes");
+        clamp(&mut self.body_buffer, 1, 256, "body_buffer");
+        clamp(&mut self.max_connections, 1, 4096, "max_connections");
+        clamp(&mut self.max_tunnels, 1, 4096, "max_tunnels");
+
+        let per_download_retention = retention_slices
+            .saturating_mul(self.slice_bytes)
+            .saturating_add(DOWNSTREAM_QUEUE_RETENTION);
+        let memory_max_downloads =
+            (MAX_TOTAL_DOWNSTREAM_RETENTION / per_download_retention).clamp(1, 100_000) as usize;
+        clamp(
+            &mut self.max_downloads,
+            1,
+            memory_max_downloads,
+            "max_downloads",
+        );
         clamp(
             &mut self.max_origin_connections,
             1,
-            100_000,
+            4096,
             "max_origin_connections",
         );
         clamp(&mut self.header_timeout_secs, 0, 300, "header_timeout_secs");
@@ -148,7 +181,7 @@ impl Config {
         clamp(
             &mut self.probe_cache_entries,
             1,
-            100_000,
+            16_384,
             "probe_cache_entries",
         );
         clamp(
@@ -165,15 +198,6 @@ impl Config {
                 "origin cap below worst-case fan-out; segments will queue (still correct)"
             );
         }
-        // The completion window never drops below one slice per worker, so
-        // giant slices imply giant retention floors no matter the other caps.
-        if (self.workers as u64).saturating_mul(self.slice_bytes) > 256 << 20 {
-            tracing::warn!(
-                workers = self.workers,
-                slice_bytes = self.slice_bytes,
-                "striped retention floor above 256 MiB per download; lower --workers or --slice-bytes to bound RAM"
-            );
-        }
         self
     }
 }
@@ -181,6 +205,40 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn preserves_safe_backward_compatible_defaults() {
+        let cfg = Config::parse_from(["segregate"]).validated();
+        assert_eq!(cfg.max_connections, 1024);
+        assert_eq!(cfg.max_tunnels, 64);
+        assert_eq!(cfg.max_downloads, 16);
+        assert_eq!(cfg.max_origin_connections, 64);
+        assert_eq!(cfg.workers, 8);
+        assert_eq!(cfg.slice_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn clamps_connection_and_retention_budgets() {
+        let mut cfg = Config::parse_from(["segregate"]);
+        cfg.workers = 128;
+        cfg.slice_bytes = 1 << 30;
+        cfg.max_connections = 100_000;
+        cfg.max_downloads = 100_000;
+        cfg.max_origin_connections = 100_000;
+        cfg.body_buffer = 4096;
+        cfg.probe_cache_entries = 100_000;
+        let cfg = cfg.validated();
+
+        assert_eq!(cfg.max_connections, 4096);
+        assert_eq!(cfg.max_origin_connections, 4096);
+        assert_eq!(cfg.body_buffer, 256);
+        assert_eq!(cfg.probe_cache_entries, 16_384);
+        // 128 workers plus hedges at 1 MiB retain 256 MiB; adding the
+        // 16 MiB downstream queue still permits three in a 1 GiB budget.
+        assert_eq!(cfg.slice_bytes, 1024 * 1024);
+        assert_eq!(cfg.max_downloads, 3);
+    }
 
     #[test]
     fn clamps_absurd_knobs() {
@@ -196,6 +254,8 @@ mod tests {
             no_hedge: false,
             tunnel_only: false,
             ca_out: None,
+            max_connections: 0,
+            max_tunnels: 0,
             max_downloads: 0,
             max_origin_connections: 0,
             header_timeout_secs: 9999,
@@ -214,6 +274,8 @@ mod tests {
         assert_eq!(cfg.min_segment, 1);
         assert_eq!(cfg.timeout_secs, 1);
         assert_eq!(cfg.body_buffer, 1);
+        assert_eq!(cfg.max_connections, 1);
+        assert_eq!(cfg.max_tunnels, 1);
         assert_eq!(cfg.max_downloads, 1);
         assert_eq!(cfg.slice_bytes, 1024);
     }

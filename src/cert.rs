@@ -1,12 +1,16 @@
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
 use rustls::ServerConfig;
 
 /// Persistent CA for one proxy run: generated once at startup, shared
-/// read-only (`Arc`, never mutated) to sign a leaf per CONNECTed host.
-/// Export the PEM via `--ca-out` so clients can trust it once instead of
-/// passing `--no-check-certificate` for every download.
+/// read-only to sign leaves for CONNECTed hosts. A small bounded leaf cache
+/// avoids repeating ECDSA work for persistent clients without allowing an
+/// attacker-controlled authority set to grow memory forever.
 pub struct CaAuthority {
     ca_cert: rcgen::Certificate,
     ca_key: rcgen::KeyPair,
+    leaves: RwLock<HashMap<String, Arc<ServerConfig>>>,
 }
 
 impl CaAuthority {
@@ -15,7 +19,7 @@ impl CaAuthority {
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "segmented-proxy MITM CA");
+            .push(rcgen::DnType::CommonName, "segregate MITM CA");
         params.key_usages = vec![
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
@@ -23,7 +27,11 @@ impl CaAuthority {
         ];
         let ca_key = rcgen::KeyPair::generate()?;
         let ca_cert = params.self_signed(&ca_key)?;
-        Ok(Self { ca_cert, ca_key })
+        Ok(Self {
+            ca_cert,
+            ca_key,
+            leaves: RwLock::new(HashMap::new()),
+        })
     }
 
     /// PEM of the CA certificate, for `--ca-out` / trust stores.
@@ -31,9 +39,18 @@ impl CaAuthority {
         self.ca_cert.pem()
     }
 
-    /// Throwaway leaf for `host` (SAN = DNS or IP), signed by this CA.
-    /// No cache: issuance is sub-millisecond ECDSA, nothing to lock.
-    pub fn leaf_config(&self, host: &str) -> Result<ServerConfig, rcgen::Error> {
+    /// Return a cached leaf for `host`, or issue a bounded-cache leaf.
+    pub fn leaf_config(&self, host: &str) -> Result<Arc<ServerConfig>, rcgen::Error> {
+        if let Some(config) = self
+            .leaves
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(host)
+            .cloned()
+        {
+            return Ok(config);
+        }
+
         let mut params = rcgen::CertificateParams::new(vec![host.to_owned()])?;
         params
             .distinguished_name
@@ -45,9 +62,25 @@ impl CaAuthority {
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
             rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
         );
-        ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![leaf.der().clone()], key)
-            .map_err(|_| rcgen::Error::CouldNotParseCertificate)
+        let config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![leaf.der().clone()], key)
+                .map_err(|_| rcgen::Error::CouldNotParseCertificate)?,
+        );
+
+        let mut leaves = self
+            .leaves
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        const MAX_LEAVES: usize = 256;
+        if leaves.len() >= MAX_LEAVES
+            && !leaves.contains_key(host)
+            && let Some(victim) = leaves.keys().next().cloned()
+        {
+            leaves.remove(&victim);
+        }
+        leaves.insert(host.to_owned(), config.clone());
+        Ok(config)
     }
 }

@@ -12,6 +12,7 @@ use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use tokio::sync::{OwnedSemaphorePermit, watch};
+use tokio_util::sync::CancellationToken;
 
 use tracing::Instrument;
 
@@ -55,7 +56,7 @@ impl Timeouts {
 /// number of idle FDs across many distinct origins.
 pub fn build_client(
     ca_bundle: Option<&std::path::Path>,
-    pool_max_idle_per_host: usize,
+    _pool_max_idle_per_host: usize,
 ) -> Result<ProxyClient, String> {
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
@@ -98,7 +99,11 @@ pub fn build_client(
         .build();
     Ok(
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .pool_max_idle_per_host(pool_max_idle_per_host.max(1))
+            // No idle pool: Hyper's pool budget is per authority, while this
+            // proxy accepts untrusted authority cardinality. Active exchanges
+            // remain bounded by Origin::get; completed sockets are not kept.
+            .pool_timer(hyper_util::rt::TokioTimer::new())
+            .pool_max_idle_per_host(0)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build(connector),
     )
@@ -147,18 +152,71 @@ impl http_body::Body for PipeBody {
     }
 }
 
+/// Response body guard: keeps the download permit and cancellation token
+/// alive for exactly as long as Hyper can still be streaming the response.
+struct GuardedBody {
+    inner: BoxBody,
+    _permit: OwnedSemaphorePermit,
+    cancel: CancellationToken,
+}
+
+impl http_body::Body for GuardedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for GuardedBody {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// Attach a download permit and cancellation scope to a response body.
+pub fn guard_response(
+    response: Response<BoxBody>,
+    permit: OwnedSemaphorePermit,
+    cancel: CancellationToken,
+) -> Response<BoxBody> {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        GuardedBody {
+            inner: body,
+            _permit: permit,
+            cancel,
+        }
+        .boxed(),
+    )
+}
+
 /// Logging-only redaction: strip possible `user:pass@` so credentials never
 /// land in spans or logs. Routing always uses the full URI.
 pub fn redact_uri(uri: &Uri) -> String {
     let s = uri.to_string();
     let Some((scheme, rest)) = s.split_once("://") else {
-        return s;
+        return s.split('?').next().unwrap_or(&s).to_owned();
     };
     let authz_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, _) = rest.split_at(authz_end);
+    let (authority, suffix) = rest.split_at(authz_end);
+    let suffix = suffix.split('?').next().unwrap_or("");
     match authority.rsplit_once('@') {
-        Some((_, host)) => format!("{scheme}://[redacted]@{host}{}", &rest[authz_end..]),
-        None => s,
+        Some((_, host)) => format!("{scheme}://[redacted]@{host}{suffix}"),
+        None => format!("{scheme}://{authority}{suffix}"),
     }
 }
 
@@ -166,24 +224,27 @@ pub fn redact_uri(uri: &Uri) -> String {
 /// downstream (or from cache). `Date` is dropped too: hyper stamps a fresh
 /// one, which also keeps cached replays from serving stale dates.
 fn scrub_response_headers(headers: &mut HeaderMap) {
-    const DROP: [&str; 6] = [
+    const DROP: [&str; 9] = [
         "connection",
+        "proxy-connection",
+        "keep-alive",
         "trailer",
+        "transfer-encoding",
         "te",
         "upgrade",
         "proxy-authenticate",
         "date",
     ];
     let mut listed: Vec<String> = Vec::new();
-    if let Some(v) = headers
-        .get(http::header::CONNECTION)
-        .and_then(|v| v.to_str().ok())
-    {
-        listed.extend(
-            v.split(',')
-                .map(|t| t.trim().to_lowercase())
-                .filter(|t| !t.is_empty()),
-        );
+    for value in headers.get_all(http::header::CONNECTION).iter() {
+        if let Ok(value) = value.to_str() {
+            listed.extend(
+                value
+                    .split(',')
+                    .map(|token| token.trim().to_lowercase())
+                    .filter(|token| !token.is_empty()),
+            );
+        }
     }
     for name in DROP {
         headers.remove(name);
@@ -205,11 +266,28 @@ pub fn segment_headers(src: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
 /// Headers forwarded with a request body (POST/PUT/...): keeps
 /// `Content-Length` and `Accept-Encoding` for a transparent tunnel.
 pub fn passthrough_headers(src: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
-    forward_headers(src, true, false)
+    forward_headers(src, !has_transfer_encoding(src), false)
+}
+
+/// Whether a request contains ambiguous HTTP/1 framing.
+pub fn has_ambiguous_framing(src: &HeaderMap) -> bool {
+    has_transfer_encoding(src) && src.contains_key(http::header::CONTENT_LENGTH)
+}
+
+fn has_transfer_encoding(src: &HeaderMap) -> bool {
+    src.get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .any(|value| {
+            value.to_str().ok().is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
+            })
+        })
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
-    const HOP: [&str; 8] = [
+    const HOP: [&str; 9] = [
         "connection",
         "proxy-connection",
         "proxy-authenticate",
@@ -217,6 +295,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
         "keep-alive",
         "te",
         "trailer",
+        "transfer-encoding",
         "upgrade",
     ];
     let n = name.as_str();
@@ -234,13 +313,18 @@ fn forward_headers(
     preserve_content_length: bool,
     strip_encoding: bool,
 ) -> Vec<(HeaderName, HeaderValue)> {
-    let conn = src
-        .get("connection")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let connections: Vec<&str> = src
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
     src.iter()
         .filter(|(n, _)| !is_hop_by_hop(n))
-        .filter(|(n, _)| !connection_listed(conn, n.as_str()))
+        .filter(|(n, _)| {
+            !connections
+                .iter()
+                .any(|connection| connection_listed(connection, n.as_str()))
+        })
         // Range / content framing are set per-request, never forwarded blindly.
         // `Host` is dropped too: hyper sets it from the target URI, and a
         // forwarded client Host breaks virtual-host routing (notably for
@@ -384,12 +468,12 @@ async fn origin_fetch(
     headers: &[(HeaderName, HeaderValue)],
     range: Option<(u64, u64)>,
     timeouts: Timeouts,
-) -> Result<Response<Incoming>, FetchFail> {
+) -> Result<(Response<Incoming>, OwnedSemaphorePermit), FetchFail> {
     let req = build_origin_request(method, uri, headers, range).map_err(|e| {
         tracing::debug!(error = ?e, uri = %redact_uri(uri), "origin request build failed");
         FetchFail::Transport
     })?;
-    let (resp, _permit) = tokio::time::timeout(timeouts.first_byte, origin.get(req))
+    let (resp, permit) = tokio::time::timeout(timeouts.first_byte, origin.get(req))
         .await
         .map_err(|_| FetchFail::Timeout)?
         .map_err(|e| {
@@ -403,7 +487,7 @@ async fn origin_fetch(
             }
             FetchFail::Transport
         })?;
-    Ok(resp)
+    Ok((resp, permit))
 }
 
 #[derive(Debug)]
@@ -425,9 +509,13 @@ struct Probe {
 /// Consecutive empty frames are capped: an origin dripping zero-length
 /// frames must stall out via timeout, not spin the loop forever.
 pub(crate) async fn drain_limited(mut body: Incoming, timeout: Duration, mut limit: u64) {
+    let deadline = Instant::now() + timeout.saturating_mul(4);
     let mut empty = 0u32;
     while limit > 0 {
-        match tokio::time::timeout(timeout, body.frame()).await {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match tokio::time::timeout(remaining.min(timeout), body.frame()).await {
             Ok(Some(Ok(frame))) if frame.is_data() => {
                 if let Ok(data) = frame.into_data() {
                     let n = data.len() as u64;
@@ -461,13 +549,21 @@ async fn probe(
     let timeout = timeouts.chunk;
     for attempt in 0..3 {
         match origin_fetch(origin, &Method::GET, uri, headers, Some((0, 0)), timeouts).await {
-            Ok(resp) => {
+            Ok((resp, permit)) => {
                 let (mut parts, body) = resp.into_parts();
+                let _permit = permit;
+                // Probe metadata is shared between workers/clients. Session
+                // cookies belong to the full exchange, never to a range probe.
+                parts.headers.remove(http::header::SET_COOKIE);
+                parts.headers.remove("set-cookie2");
                 tracing::debug!(attempt, status = %parts.status, uri = %redact_uri(uri), "probe response");
                 if parts.status == StatusCode::PARTIAL_CONTENT {
                     drain_limited(body, timeout, 16).await;
                     if let Some(v) = parts.headers.get(http::header::CONTENT_RANGE).cloned()
-                        && let Some((_, _, total)) = parse_content_range(&v)
+                        && let Some((start, end, total)) = parse_content_range(&v)
+                        && start == 0
+                        && end == 0
+                        && total > 0
                     {
                         parts.headers.remove(http::header::CONTENT_RANGE);
                         parts.headers.remove(http::header::CONTENT_LENGTH);
@@ -499,7 +595,9 @@ async fn probe(
                 if parts.status.is_client_error() {
                     return None;
                 }
-                // 5xx: retry probe.
+                // 5xx: retry probe after releasing the response permit.
+                drop(_permit);
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
             Err(e) => {
                 tracing::debug!(attempt, error = ?e, uri = %redact_uri(uri), "probe fetch failed");
@@ -520,30 +618,56 @@ enum HedgeOutcome {
     Progress(Bytes, bool),
     /// Both sides dead.
     Dead,
+    /// The parent download was canceled.
+    Cancelled,
 }
 
-/// Fetch at most the first data chunk of `[cur, h_end]` as a stall hedge.
-/// Bounded by construction: one request, headers + first frame timeouts,
-/// then the task ends whether or not it delivered.
-async fn hedge_first_bytes(
+struct HedgeBytes {
     origin: Origin,
     uri: Uri,
     headers: Vec<(HeaderName, HeaderValue)>,
     cur: u64,
     h_end: u64,
+    total: u64,
+    validator: Option<HeaderValue>,
+    cancel: CancellationToken,
     timeouts: Timeouts,
-) -> Option<Bytes> {
+}
+
+/// Fetch at most the first data chunk of `[cur, h_end]` as a stall hedge.
+/// Bounded by construction: one request, headers + first frame timeouts,
+/// then the task ends whether or not it delivered.
+async fn hedge_first_bytes(ctx: HedgeBytes) -> Option<Bytes> {
+    let HedgeBytes {
+        origin,
+        uri,
+        headers,
+        cur,
+        h_end,
+        total,
+        validator,
+        cancel,
+        timeouts,
+    } = ctx;
     let req = build_origin_request(&Method::GET, &uri, &headers, Some((cur, h_end))).ok()?;
-    let (resp, _permit) = tokio::time::timeout(timeouts.first_byte, origin.get(req))
-        .await
-        .ok()?
-        .ok()?;
-    if resp.status() != StatusCode::PARTIAL_CONTENT {
+    let response = tokio::select! {
+        _ = cancel.cancelled() => return None,
+        response = tokio::time::timeout(timeouts.first_byte, origin.get(req)) => response,
+    };
+    let (resp, _permit) = response.ok()?.ok()?;
+    if resp.status() != StatusCode::PARTIAL_CONTENT
+        || !valid_slice_response(resp.headers(), cur, h_end, total, validator.as_ref())
+    {
         return None;
     }
     let mut body = resp.into_body();
+    let mut trailers = 0u32;
     loop {
-        match tokio::time::timeout(timeouts.chunk, body.frame()).await {
+        let frame = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            frame = tokio::time::timeout(timeouts.chunk, body.frame()) => frame,
+        };
+        match frame {
             Ok(Some(Ok(frame))) if frame.is_data() => {
                 match frame.into_data() {
                     // An empty first frame is a stall signal, not data:
@@ -552,35 +676,65 @@ async fn hedge_first_bytes(
                     _ => return None,
                 }
             }
-            Ok(Some(Ok(_))) => {} // trailers: keep waiting within budget
+            Ok(Some(Ok(_))) => {
+                trailers += 1;
+                if trailers > 16 {
+                    return None;
+                }
+            }
             _ => return None,
         }
     }
 }
 
+struct HedgeRace<'a> {
+    origin: &'a Origin,
+    uri: &'a Uri,
+    headers: &'a [(HeaderName, HeaderValue)],
+    old: &'a mut Incoming,
+    cur: u64,
+    end: u64,
+    total: u64,
+    validator: Option<&'a HeaderValue>,
+    cancel: &'a CancellationToken,
+    timeouts: Timeouts,
+}
+
 /// Race the stalled `old` body against one bounded duplicate request for the
 /// same bytes. `biased` keeps a healthy connection on priority: if the old
 /// body delivers within the grace window it wins and the hedge is aborted.
-async fn race_hedge(
-    origin: &Origin,
-    uri: &Uri,
-    headers: &[(HeaderName, HeaderValue)],
-    old: &mut Incoming,
-    cur: u64,
-    end: u64,
-    timeouts: Timeouts,
-) -> HedgeOutcome {
-    let h_end = (cur + 256 * 1024 - 1).min(end);
-    let mut hedge = tokio::spawn(hedge_first_bytes(
-        origin.clone(),
-        uri.clone(),
-        headers.to_vec(),
+async fn race_hedge(ctx: HedgeRace<'_>) -> HedgeOutcome {
+    let HedgeRace {
+        origin,
+        uri,
+        headers,
+        old,
+        cur,
+        end,
+        total,
+        validator,
+        cancel,
+        timeouts,
+    } = ctx;
+    let h_end = cur.saturating_add(256 * 1024 - 1).min(end);
+    let hedge_validator = validator.cloned();
+    let mut hedge = tokio::spawn(hedge_first_bytes(HedgeBytes {
+        origin: origin.clone(),
+        uri: uri.clone(),
+        headers: headers.to_vec(),
         cur,
         h_end,
+        total,
+        validator: hedge_validator,
+        cancel: cancel.clone(),
         timeouts,
-    ));
+    }));
     tokio::select! {
         biased;
+        _ = cancel.cancelled() => {
+            hedge.abort();
+            HedgeOutcome::Cancelled
+        }
         res = tokio::time::timeout(timeouts.chunk, old.frame()) => {
             hedge.abort();
             match res {
@@ -614,17 +768,16 @@ fn fit_to_window(mut data: Bytes, cur: u64, end: u64) -> Bytes {
 type SliceResult = Result<Bytes, ()>;
 
 /// Split `[start, end]` into contiguous slices of at most `slice_bytes`.
-/// Caps the slice count so absurd lengths grow granularity instead of the
-/// Vec: at most a million entries no matter the claimed total.
+/// Refuse absurd ranges instead of silently enlarging slices beyond the
+/// configured memory bound; the caller falls back to one full connection.
 fn split_slices(start: u64, end: u64, mut slice_bytes: u64) -> Vec<(u64, u64)> {
     const MAX_SLICES: u64 = 1_000_000;
     slice_bytes = slice_bytes.max(1);
     let len = end.saturating_sub(start).saturating_add(1);
-    if len == 0 {
+    if len == 0 || len.div_ceil(slice_bytes) > MAX_SLICES {
         return Vec::new();
     }
-    slice_bytes = slice_bytes.max(len.div_ceil(MAX_SLICES).max(1));
-    let mut out = Vec::with_capacity(len.div_ceil(slice_bytes).min(MAX_SLICES) as usize);
+    let mut out = Vec::with_capacity(len.div_ceil(slice_bytes) as usize);
     let mut cur = start;
     while cur <= end {
         let slice_end = cur.saturating_add(slice_bytes - 1).min(end);
@@ -654,20 +807,137 @@ fn etag_eq(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
+/// Strong validator used to pin all range requests to the probe response.
+fn strong_validator(headers: &HeaderMap) -> Option<HeaderValue> {
+    headers
+        .get(http::header::ETAG)
+        .filter(|value| {
+            value
+                .to_str()
+                .ok()
+                .is_some_and(|value| !value.trim_start().starts_with("W/"))
+        })
+        .cloned()
+        .or_else(|| headers.get(http::header::LAST_MODIFIED).cloned())
+}
+
+fn response_validator_matches(headers: &HeaderMap, expected: &HeaderValue) -> bool {
+    let Some(expected) = expected.to_str().ok() else {
+        return false;
+    };
+    if expected.trim_start().starts_with("W/") {
+        return false;
+    }
+    if expected.trim_start().starts_with('"') {
+        headers
+            .get(http::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|actual| etag_eq(actual, expected))
+    } else {
+        headers
+            .get(http::header::LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|actual| actual == expected)
+    }
+}
+
+fn valid_slice_response(
+    headers: &HeaderMap,
+    start: u64,
+    end: u64,
+    total: u64,
+    expected_validator: Option<&HeaderValue>,
+) -> bool {
+    let Some((actual_start, actual_end, actual_total)) = headers
+        .get(http::header::CONTENT_RANGE)
+        .and_then(parse_content_range)
+    else {
+        return false;
+    };
+    if actual_start != start || actual_end != end || actual_total != total {
+        return false;
+    }
+    if let Some(length) = content_length(headers)
+        && length != end.saturating_sub(start).saturating_add(1)
+    {
+        return false;
+    }
+    expected_validator.is_none_or(|validator| response_validator_matches(headers, validator))
+}
+
 /// True when the origin allows this response to be cached: an explicit
 /// `no-store` opts out, and we honor it instead of serving stale bytes.
-fn cacheable(headers: &HeaderMap) -> bool {
-    !headers
+fn probe_shareable(headers: &HeaderMap) -> bool {
+    let control: Vec<String> = headers
         .get_all(http::header::CACHE_CONTROL)
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| s.split(','))
-        .any(|t| t.trim().eq_ignore_ascii_case("no-store"))
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .collect();
+    !control
+        .iter()
+        .any(|token| matches!(token.as_str(), "no-store" | "private" | "no-cache"))
+        && !headers.contains_key(http::header::EXPIRES)
+}
+
+fn cacheable(headers: &HeaderMap) -> bool {
+    let control: Vec<String> = headers
+        .get_all(http::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .collect();
+    if control.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "no-store" | "private" | "no-cache" | "must-revalidate"
+        ) || token.starts_with("max-age=")
+            || token.starts_with("s-maxage=")
+    }) {
+        return false;
+    }
+    // The probe cache is metadata-only. Without carrying an Expires deadline
+    // in the snapshot, an explicit Expires is safer treated as uncacheable.
+    !headers.contains_key(http::header::EXPIRES)
 }
 
 /// Honor a downstream conditional against the origin validators we already
 /// hold: a matching `If-None-Match` short-circuits the whole download with
 /// `304` instead of re-fetching bytes the client already has.
+fn has_conditional_request(headers: &HeaderMap) -> bool {
+    [
+        http::header::IF_MATCH,
+        http::header::IF_NONE_MATCH,
+        http::header::IF_RANGE,
+        http::header::IF_MODIFIED_SINCE,
+        http::header::IF_UNMODIFIED_SINCE,
+    ]
+    .iter()
+    .any(|name| headers.contains_key(name))
+}
+
+fn request_cache_bypass(headers: &HeaderMap) -> bool {
+    let no_cache = headers
+        .get_all(http::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| {
+            let token = token.trim();
+            token.eq_ignore_ascii_case("no-cache")
+                || token.eq_ignore_ascii_case("no-store")
+                || token.eq_ignore_ascii_case("max-age=0")
+        });
+    no_cache
+        || headers
+            .get_all(http::header::PRAGMA)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| value.trim().eq_ignore_ascii_case("no-cache"))
+}
+
 fn check_not_modified(
     origin_headers: &HeaderMap,
     client_headers: &HeaderMap,
@@ -719,6 +989,11 @@ struct SliceFetch<'a> {
     shared: &'a Shared,
     uri: &'a Uri,
     headers: &'a [(HeaderName, HeaderValue)],
+    total: u64,
+    validator: Option<&'a HeaderValue>,
+    cancel: &'a CancellationToken,
+    range_ignored: &'a AtomicBool,
+    progress: &'a tokio::sync::Notify,
     tx: &'a tokio::sync::mpsc::Sender<(u64, SliceResult)>,
     cache_key: Option<&'a str>,
 }
@@ -728,6 +1003,11 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
         shared,
         uri,
         headers,
+        total,
+        validator,
+        cancel,
+        range_ignored,
+        progress,
         tx,
         cache_key,
     } = job;
@@ -744,8 +1024,13 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
     // Reports the slice outcome; the coordinator may already be gone.
     macro_rules! finish {
         ($result:expr) => {{
-            let _ = tx.send((idx, $result)).await;
-            return;
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                result = tx.send((idx, $result)) => {
+                    let _ = result;
+                    return;
+                }
+            }
         }};
     }
     // Appends one origin chunk (windowed into this slice). An empty frame
@@ -761,12 +1046,16 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
             }
             buf.extend_from_slice(&data);
             cur += data.len() as u64;
+            progress.notify_one();
             fails = 0;
             backoff = Duration::from_millis(200);
             cur > end
         }};
     }
     loop {
+        if range_ignored.load(Ordering::Relaxed) {
+            finish!(Err(()));
+        }
         if cur > end {
             finish!(Ok(buf.freeze()));
         }
@@ -790,30 +1079,58 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
                 tracing::debug!(error = ?e, "slice request build failed; retrying");
                 fails += 1;
                 metrics.origin_retries.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
                 backoff = backoff_next(backoff);
                 continue;
             }
         };
-        let (resp, _permit) =
-            match tokio::time::timeout(timeouts.first_byte, shared.origin.get(req)).await {
-                Ok(Ok(x)) => x,
-                _ => {
-                    fails += 1;
-                    metrics.origin_retries.fetch_add(1, Ordering::Relaxed);
-                    tokio::time::sleep(backoff).await;
-                    backoff = backoff_next(backoff);
-                    continue;
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return,
+            response = tokio::time::timeout(timeouts.first_byte, shared.origin.get(req)) => response,
+        };
+        let (resp, permit) = match response {
+            Ok(Ok(x)) => x,
+            _ => {
+                fails += 1;
+                metrics.origin_retries.fetch_add(1, Ordering::Relaxed);
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
                 }
-            };
+                backoff = backoff_next(backoff);
+                continue;
+            }
+        };
+        if resp.status() == StatusCode::PARTIAL_CONTENT
+            && !valid_slice_response(resp.headers(), cur, end, *total, *validator)
+        {
+            drop(resp);
+            drop(permit);
+            fails += 1;
+            metrics.origin_retries.fetch_add(1, Ordering::Relaxed);
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = backoff_next(backoff);
+            continue;
+        }
         if resp.status() == StatusCode::PARTIAL_CONTENT {
             let mut body = resp.into_body();
             let mut hedged = false;
+            let mut trailers = 0u32;
             loop {
                 if cur > end {
                     finish!(Ok(buf.freeze()));
                 }
-                match tokio::time::timeout(timeout, body.frame()).await {
+                let frame = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    frame = tokio::time::timeout(timeout, body.frame()) => frame,
+                };
+                match frame {
                     Ok(Some(Ok(frame))) if frame.is_data() => match frame.into_data() {
                         Ok(data) => {
                             if append!(data) {
@@ -823,7 +1140,14 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
                         }
                         Err(_) => break,
                     },
-                    Ok(Some(Ok(_))) => {} // trailers: ignore
+                    Ok(Some(Ok(_))) => {
+                        trailers += 1;
+                        if trailers > 16 {
+                            fails += 1;
+                            metrics.origin_retries.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                    }
                     // Truncated mid-slice or per-chunk timeout.
                     _ => {
                         let remaining = end - cur + 1;
@@ -831,15 +1155,18 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
                             hedged = true;
                             tracing::debug!(cur, end, "stall: racing hedged duplicate");
                             metrics.hedges.fetch_add(1, Ordering::Relaxed);
-                            match race_hedge(
-                                &shared.origin,
+                            match race_hedge(HedgeRace {
+                                origin: &shared.origin,
                                 uri,
                                 headers,
-                                &mut body,
+                                old: &mut body,
                                 cur,
                                 end,
+                                total: *total,
+                                validator: *validator,
+                                cancel,
                                 timeouts,
-                            )
+                            })
                             .await
                             {
                                 HedgeOutcome::Progress(data, from_hedge) => {
@@ -854,6 +1181,7 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
                                     // at most one hedge per body keeps the
                                     // duplicate-connection budget bounded.
                                 }
+                                HedgeOutcome::Cancelled => return,
                                 HedgeOutcome::Dead => {
                                     fails += 1;
                                     metrics.origin_retries.fetch_add(1, Ordering::Relaxed);
@@ -869,45 +1197,25 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
                 }
             }
         } else if resp.status() == StatusCode::OK {
-            // Origin ignored Range: stream the full body, skipping to `cur`.
-            // (File offsets: a 200 body starts at byte 0.)
-            let mut skip = cur;
-            let mut body = resp.into_body();
-            loop {
-                if cur > end {
-                    finish!(Ok(buf.freeze()));
-                }
-                match tokio::time::timeout(timeout, body.frame()).await {
-                    Ok(Some(Ok(frame))) if frame.is_data() => match frame.into_data() {
-                        Ok(mut data) => {
-                            if skip > 0 {
-                                let incoming = data.len() as u64;
-                                let drop = incoming.min(skip) as usize;
-                                let _ = data.split_to(drop);
-                                skip -= drop as u64;
-                                if incoming == 0 {
-                                    fails += 1;
-                                    metrics.origin_retries.fetch_add(1, Ordering::Relaxed);
-                                    break;
-                                }
-                                if data.is_empty() {
-                                    continue;
-                                }
-                            }
-                            if append!(data) {
-                                finish!(Ok(buf.freeze()));
-                            }
-                        }
-                        Err(_) => break,
-                    },
-                    Ok(Some(Ok(_))) => {} // trailers: ignore
-                    _ => {
-                        fails += 1;
-                        metrics.origin_retries.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                }
+            if validator
+                .is_some_and(|validator| !response_validator_matches(resp.headers(), validator))
+            {
+                drop(resp);
+                drop(permit);
+                metrics.truncations.fetch_add(1, Ordering::Relaxed);
+                finish!(Err(()));
             }
+            // A ranged request answered with a full representation. Do not
+            // discard a prefix independently for every slice: that turns a
+            // range-ignoring origin into quadratic bandwidth amplification.
+            range_ignored.store(true, Ordering::Relaxed);
+            if let Some(key) = cache_key {
+                shared.probe_cache.invalidate(key);
+            }
+            drop(resp);
+            drop(permit);
+            metrics.truncations.fetch_add(1, Ordering::Relaxed);
+            finish!(Err(()));
         } else {
             // 416: our (possibly cached) length is stale — drop the cache
             // entry so the next attempt re-probes. Anything else 4xx is
@@ -917,14 +1225,29 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
             {
                 shared.probe_cache.invalidate(k);
             }
-            if resp.status().is_client_error() {
+            if resp.status().is_redirection() || resp.status() == StatusCode::NO_CONTENT {
+                metrics.truncations.fetch_add(1, Ordering::Relaxed);
+                finish!(Err(()));
+            }
+            if resp.status().is_client_error()
+                && !matches!(
+                    resp.status(),
+                    StatusCode::REQUEST_TIMEOUT
+                        | StatusCode::TOO_EARLY
+                        | StatusCode::TOO_MANY_REQUESTS
+                )
+            {
                 metrics.truncations.fetch_add(1, Ordering::Relaxed);
                 finish!(Err(()));
             }
             fails += 1;
             metrics.origin_retries.fetch_add(1, Ordering::Relaxed);
         }
-        tokio::time::sleep(backoff).await;
+        drop(permit);
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
         backoff = backoff_next(backoff);
     }
 }
@@ -939,6 +1262,11 @@ struct WorkerCtx {
     next: Arc<AtomicU64>,
     need_rx: watch::Receiver<u64>,
     window: u64,
+    total: u64,
+    validator: Option<HeaderValue>,
+    cancel: CancellationToken,
+    range_ignored: Arc<AtomicBool>,
+    progress: Arc<tokio::sync::Notify>,
     tx: tokio::sync::mpsc::Sender<(u64, SliceResult)>,
     cache_key: Option<String>,
 }
@@ -955,20 +1283,30 @@ async fn slice_worker(ctx: WorkerCtx) {
         next,
         mut need_rx,
         window,
+        total: file_total,
+        validator,
+        cancel,
+        range_ignored,
+        progress,
         tx,
         cache_key,
     } = ctx;
-    let total = slices.len() as u64;
+    let total_slices = slices.len() as u64;
     loop {
         // Copy out first: the borrow guard must not be held across `await`
         // (it is neither `Send` nor re-entrant).
         let need = *need_rx.borrow();
-        if let Some(idx) = try_claim(&next, need, window, total) {
+        if let Some(idx) = try_claim(&next, need, window, total_slices) {
             let (s, e) = slices[idx as usize];
             let job = SliceFetch {
                 shared: &shared,
                 uri: &uri,
                 headers: &headers,
+                total: file_total,
+                validator: validator.as_ref(),
+                cancel: &cancel,
+                range_ignored: &range_ignored,
+                progress: &progress,
                 tx: &tx,
                 cache_key: cache_key.as_deref(),
             };
@@ -978,12 +1316,12 @@ async fn slice_worker(ctx: WorkerCtx) {
         // Window full (or all claimed): sleep until the coordinator advances
         // `need`, or exit when it is gone. `wait_for` re-evaluates the
         // predicate on every send, so no wakeup is ever missed.
-        match need_rx
-            .wait_for(|&n| claimable(&next, n, window, total))
-            .await
-        {
-            Ok(_) => {}
-            Err(_) => return,
+        let waited = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = need_rx.wait_for(|&n| claimable(&next, n, window, total_slices)) => result,
+        };
+        if waited.is_err() {
+            return;
         }
     }
 }
@@ -1006,13 +1344,20 @@ fn declared_len(headers: &[(HeaderName, HeaderValue)]) -> Option<u64> {
         .ok()
 }
 
+struct UploadState {
+    done: AtomicBool,
+    overflow: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
 /// Client upload body cut off at `remaining` bytes. Overruns end the stream
 /// cleanly and set `overflow` so the caller can answer 413 instead of
 /// forwarding a silently truncated upload.
 struct CappedBody {
     inner: Pin<Box<BoxBody>>,
     remaining: u64,
-    overflow: Arc<AtomicBool>,
+    state: Arc<UploadState>,
+    empty_frames: u32,
 }
 
 impl http_body::Body for CappedBody {
@@ -1028,8 +1373,20 @@ impl http_body::Body for CappedBody {
             Poll::Ready(Some(Ok(frame))) if frame.is_data() => match frame.into_data() {
                 Ok(data) => {
                     let n = data.len() as u64;
+                    if n == 0 {
+                        this.empty_frames += 1;
+                        if this.empty_frames > 16 {
+                            this.state.done.store(true, Ordering::Relaxed);
+                            this.state.notify.notify_one();
+                            return Poll::Ready(None);
+                        }
+                        return Poll::Ready(Some(Ok(Frame::data(data))));
+                    }
+                    this.empty_frames = 0;
                     if n > this.remaining {
-                        this.overflow.store(true, Ordering::Relaxed);
+                        this.state.overflow.store(true, Ordering::Relaxed);
+                        this.state.done.store(true, Ordering::Relaxed);
+                        this.state.notify.notify_one();
                         return Poll::Ready(None);
                     }
                     this.remaining -= n;
@@ -1038,6 +1395,11 @@ impl http_body::Body for CappedBody {
                 // Unreachable for data frames; end cleanly rather than spin.
                 Err(_) => Poll::Ready(None),
             },
+            Poll::Ready(None) => {
+                this.state.done.store(true, Ordering::Relaxed);
+                this.state.notify.notify_one();
+                Poll::Ready(None)
+            }
             other => other,
         }
     }
@@ -1052,33 +1414,53 @@ fn pump_incoming(
     timeout: Duration,
     metrics: Arc<Metrics>,
     permit: OwnedSemaphorePermit,
-    abort: Option<Arc<AtomicBool>>,
+    abort: Option<Arc<UploadState>>,
 ) -> tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, hyper::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel(depth);
     tokio::spawn(async move {
         let _permit = permit; // held for the whole body lifetime
         let mut body = body;
         let mut sent: u64 = 0;
+        let deadline = Instant::now() + timeout.saturating_mul(4);
+        let mut trailers = 0u32;
         loop {
-            if abort.as_ref().is_some_and(|a| a.load(Ordering::Relaxed)) {
+            if abort
+                .as_ref()
+                .is_some_and(|state| state.overflow.load(Ordering::Relaxed))
+            {
                 tracing::warn!(sent, "upload over cap; truncating");
                 metrics.truncations.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            match tokio::time::timeout(timeout, body.frame()).await {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                metrics.truncations.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            match tokio::time::timeout(remaining.min(timeout), body.frame()).await {
                 Ok(Some(Ok(frame))) if frame.is_data() => match frame.into_data() {
                     Ok(data) => {
                         let n = data.len() as u64;
                         sent += n;
-                        metrics.bytes_out.fetch_add(n, Ordering::Relaxed);
-                        if tx.send(Ok(Frame::data(data))).await.is_err() {
-                            return; // downstream gone
+                        match tokio::time::timeout(timeout, tx.send(Ok(Frame::data(data)))).await {
+                            Ok(Ok(())) => {
+                                metrics.bytes_out.fetch_add(n, Ordering::Relaxed);
+                            }
+                            Ok(Err(_)) | Err(_) => {
+                                metrics.truncations.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
                         }
                     }
                     Err(_) => break,
                 },
-                Ok(Some(Ok(_))) => {} // trailers: ignore
-                Ok(None) => break,    // clean end of a finite body
+                Ok(Some(Ok(_))) => {
+                    trailers += 1;
+                    if trailers > 16 {
+                        metrics.truncations.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+                Ok(None) => break, // clean end of a finite body
                 Ok(Some(Err(_))) => {
                     // Transport died mid-body: downstream sees a short body.
                     metrics.truncations.fetch_add(1, Ordering::Relaxed);
@@ -1109,7 +1491,16 @@ async fn passthrough(shared: Shared, origin_req: Request<BoxBody>) -> Response<B
                 return bad_gateway();
             }
         };
-    let (mut parts, body) = resp.into_parts();
+    stream_passthrough(shared, resp, permit)
+}
+
+fn stream_passthrough(
+    shared: Shared,
+    response: hyper::Response<Incoming>,
+    permit: OwnedSemaphorePermit,
+) -> Response<BoxBody> {
+    let timeouts = Timeouts::new(shared.cfg.connect_timeout_secs, shared.cfg.timeout_secs);
+    let (mut parts, body) = response.into_parts();
     scrub_response_headers(&mut parts.headers);
     let rx = pump_incoming(
         body,
@@ -1125,11 +1516,29 @@ async fn passthrough(shared: Shared, origin_req: Request<BoxBody>) -> Response<B
 /// Entry point for one downstream GET. Headers flush as soon as the probe
 /// (or cache) resolves; body chunks stream in order as segment 0 produces
 /// them.
+#[cfg(test)]
 pub async fn serve_get(
     shared: Shared,
     uri: Uri,
     req_headers: HeaderMap,
     downstream_range: Option<HeaderValue>,
+) -> Response<BoxBody> {
+    serve_get_with_cancel(
+        shared,
+        uri,
+        req_headers,
+        downstream_range,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+pub async fn serve_get_with_cancel(
+    shared: Shared,
+    uri: Uri,
+    req_headers: HeaderMap,
+    downstream_range: Option<HeaderValue>,
+    cancel: CancellationToken,
 ) -> Response<BoxBody> {
     shared.metrics.downloads.fetch_add(1, Ordering::Relaxed);
     let timeouts = Timeouts::new(shared.cfg.connect_timeout_secs, shared.cfg.timeout_secs);
@@ -1138,14 +1547,20 @@ pub async fn serve_get(
     let mut fwd_parts = fwd_probe.clone();
     strip_conditionals(&mut fwd_parts);
 
+    // Conditional/If-Range requests need the origin to evaluate the complete
+    // precondition set. Do not synthesize a response from probe metadata.
+    if has_conditional_request(&req_headers) {
+        let headers = passthrough_headers(&req_headers);
+        let request = match build_origin_request(&Method::GET, &uri, &headers, None) {
+            Ok(request) => request,
+            Err(_) => return bad_gateway(),
+        };
+        return passthrough(shared, request).await;
+    }
+
     // Probe cache: same URI + same session collapses retries/resumes to zero RTT.
-    let cache_key_opt = (!shared.probe_cache.disabled()).then(|| {
-        cache_key(
-            &uri,
-            req_headers.get(http::header::AUTHORIZATION),
-            req_headers.get(http::header::COOKIE),
-        )
-    });
+    let cache_key_opt = (!shared.probe_cache.disabled() && !request_cache_bypass(&req_headers))
+        .then(|| cache_key(&uri, &req_headers));
     let mut cached: Option<ProbeSnapshot> = None;
     if let Some(k) = &cache_key_opt
         && let Some(snap) = shared.probe_cache.get(k)
@@ -1185,6 +1600,9 @@ pub async fn serve_get(
                 match cache
                     .get_or_probe(k, budget, || async move {
                         let p = probe(&origin, &uri2, &hdrs, timeouts).await?;
+                        if !probe_shareable(&p.headers) {
+                            return None;
+                        }
                         let req_ua = hdrs
                             .iter()
                             .find(|(n, _)| *n == http::header::USER_AGENT)
@@ -1236,10 +1654,10 @@ pub async fn serve_get(
             }
         },
     };
-    let mut replay_headers = snap.headers;
     // Cached responses report their age; a cached Set-Cookie belongs to an
     // older exchange, never to this one.
-    let age_secs = from_cache.then(|| snap.probed_at.elapsed().as_secs());
+    let age_secs = from_cache.then(|| snap.age().as_secs());
+    let mut replay_headers = snap.headers;
     if from_cache {
         replay_headers.remove(http::header::SET_COOKIE);
     }
@@ -1251,6 +1669,19 @@ pub async fn serve_get(
         range_ok: snap.range_ok,
         headers: replay_headers,
     };
+    let validator = strong_validator(&probe.headers);
+    if probe.range_ok && shared.cfg.workers > 1 && validator.is_none() {
+        // Without a strong representation validator, independent ranges
+        // cannot be mixed safely. Preserve correctness with one full body.
+        let request = match build_origin_request(&Method::GET, &uri, &fwd_probe, None) {
+            Ok(request) => request,
+            Err(_) => return bad_gateway(),
+        };
+        return passthrough(shared, request).await;
+    }
+    if let Some(validator) = validator.as_ref() {
+        fwd_parts.push((http::header::IF_RANGE.clone(), validator.clone()));
+    }
     if !probe.range_ok || probe.total == 0 || shared.cfg.workers <= 1 {
         let req = match build_origin_request(&Method::GET, &uri, &fwd_probe, None) {
             Ok(r) => r,
@@ -1291,6 +1722,13 @@ pub async fn serve_get(
         return passthrough(shared, req).await;
     }
     let slices = split_slices(eff_start, eff_end, shared.cfg.slice_bytes);
+    if slices.is_empty() {
+        let request = match build_origin_request(&Method::GET, &uri, &fwd_probe, None) {
+            Ok(request) => request,
+            Err(_) => return bad_gateway(),
+        };
+        return passthrough(shared, request).await;
+    }
     if slices.len() <= 1 {
         // Degenerate single slice reads cleaner as 200 than 206.
         let range = (eff_start != 0 || eff_end != total - 1).then_some((eff_start, eff_end));
@@ -1301,6 +1739,42 @@ pub async fn serve_get(
         return passthrough(shared, req).await;
     }
     let workers = shared.cfg.workers.max(1).min(slices.len());
+    if eff_start == 0 && downstream_range.is_none() && workers > 1 {
+        // Validate the first real range before fanning out. If the origin
+        // ignores Range, switch to one linear full-body response immediately
+        // instead of letting every worker discard a growing prefix.
+        let first_end = shared.cfg.slice_bytes.saturating_sub(1).min(eff_end);
+        if let Ok(request) =
+            build_origin_request(&Method::GET, &uri, &fwd_parts, Some((eff_start, first_end)))
+        {
+            match tokio::time::timeout(timeouts.first_byte, shared.origin.get(request)).await {
+                Ok(Ok((response, permit))) if response.status() == StatusCode::OK => {
+                    return stream_passthrough(shared, response, permit);
+                }
+                Ok(Ok((response, permit))) if response.status() == StatusCode::PARTIAL_CONTENT => {
+                    if valid_slice_response(
+                        response.headers(),
+                        eff_start,
+                        first_end,
+                        total,
+                        validator.as_ref(),
+                    ) {
+                        let body = response.into_body();
+                        drain_limited(body, timeout, first_end - eff_start + 1).await;
+                        drop(permit);
+                    } else {
+                        drop(response);
+                        drop(permit);
+                    }
+                }
+                Ok(Ok((response, permit))) => {
+                    drop(response);
+                    drop(permit);
+                }
+                _ => {}
+            }
+        }
+    }
     // Completion window: enough in-flight slices to keep every worker busy
     // plus slack for variance. Completed-but-unflushed bytes stay bounded
     // by ~(window + workers) * slice_bytes no matter the file size.
@@ -1312,7 +1786,7 @@ pub async fn serve_get(
         n_slices = slices.len(),
         workers,
         slice_bytes = shared.cfg.slice_bytes,
-        uri = %uri,
+        uri = %redact_uri(&uri),
         "striped download"
     );
     let slices = Arc::new(slices);
@@ -1320,8 +1794,11 @@ pub async fn serve_get(
     let (need_tx, _) = tokio::sync::watch::channel(0u64);
     let (tx, mut rx) =
         tokio::sync::mpsc::channel::<(u64, SliceResult)>(window as usize + workers + 8);
+    let range_ignored = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(tokio::sync::Notify::new());
+    let mut worker_handles = Vec::with_capacity(workers);
     for _ in 0..workers {
-        tokio::spawn(
+        worker_handles.push(tokio::spawn(
             slice_worker(WorkerCtx {
                 shared: shared.clone(),
                 uri: uri.clone(),
@@ -1330,11 +1807,16 @@ pub async fn serve_get(
                 next: next.clone(),
                 need_rx: need_tx.subscribe(),
                 window,
+                total,
+                validator: validator.clone(),
+                cancel: cancel.clone(),
+                range_ignored: range_ignored.clone(),
+                progress: progress.clone(),
                 tx: tx.clone(),
                 cache_key: cache_key_opt.clone(),
             })
             .instrument(tracing::debug_span!("worker")),
-        );
+        ));
     }
     drop(tx);
     // Depth in frames would not bound retention (one frame can hold a whole
@@ -1351,13 +1833,19 @@ pub async fn serve_get(
         + timeouts.chunk * shared.cfg.max_slice_retries.max(1)
         + Duration::from_secs(60);
     tokio::spawn(async move {
+        let worker_handles = worker_handles;
+        let cancel = cancel;
         let mut need = 0u64;
-        let mut last_progress = tokio::time::Instant::now();
         let total_slices = slices.len() as u64;
         // Completed-but-unflushed bytes currently held; subtracted once on
         // exit so the gauge never leaks, however the task ends.
         let mut held = 0u64;
         let mut pending: HashMap<u64, SliceResult> = HashMap::new();
+        enum Wait {
+            Progress,
+            Received(Option<(u64, SliceResult)>),
+            Cancelled,
+        }
         loop {
             if need >= total_slices {
                 break;
@@ -1366,32 +1854,44 @@ pub async fn serve_get(
                 match res {
                     Ok(bytes) => {
                         let n = bytes.len() as u64;
-                        metrics.bytes_out.fetch_add(n, Ordering::Relaxed);
-                        metrics.buffered_bytes.fetch_sub(n, Ordering::Relaxed);
-                        held = held.saturating_sub(n);
                         // A downstream that stopped reading (but holds the
                         // connection) must not pin permits and origin
                         // streams forever: truncate instead.
-                        match tokio::time::timeout(timeout, body_tx.send(Ok(Frame::data(bytes))))
-                            .await
-                        {
-                            Ok(Ok(())) => {}
+                        let sent = tokio::select! {
+                            _ = cancel.cancelled() => None,
+                            result = tokio::time::timeout(timeout, body_tx.send(Ok(Frame::data(bytes)))) => Some(result),
+                        };
+                        match sent {
+                            Some(Ok(Ok(()))) => {
+                                metrics.bytes_out.fetch_add(n, Ordering::Relaxed);
+                                metrics.buffered_bytes.fetch_sub(n, Ordering::Relaxed);
+                                held = held.saturating_sub(n);
+                            }
                             _ => {
+                                metrics.buffered_bytes.fetch_sub(n, Ordering::Relaxed);
+                                held = held.saturating_sub(n);
                                 metrics.truncations.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
                         }
                         need += 1;
-                        last_progress = tokio::time::Instant::now();
                         let _ = need_tx.send(need);
                     }
                     Err(()) => break, // slice gave up -> truncate
                 }
                 continue;
             }
-            match tokio::time::timeout_at(last_progress + slot_budget, rx.recv()).await {
-                Ok(Some((idx, res))) => {
-                    last_progress = tokio::time::Instant::now();
+            let received = tokio::time::timeout(slot_budget, async {
+                tokio::select! {
+                    _ = cancel.cancelled() => Wait::Cancelled,
+                    _ = progress.notified() => Wait::Progress,
+                    result = rx.recv() => Wait::Received(result),
+                }
+            })
+            .await;
+            match received {
+                Ok(Wait::Progress) => {}
+                Ok(Wait::Received(Some((idx, res)))) => {
                     if let Ok(b) = &res {
                         let n = b.len() as u64;
                         held += n;
@@ -1399,7 +1899,8 @@ pub async fn serve_get(
                     }
                     pending.insert(idx, res);
                 }
-                Ok(None) => break, // workers gone unexpectedly -> truncate
+                Ok(Wait::Received(None)) => break,
+                Ok(Wait::Cancelled) => break,
                 Err(_) => {
                     tracing::warn!(
                         need,
@@ -1410,6 +1911,9 @@ pub async fn serve_get(
                     break;
                 }
             }
+        }
+        for worker in &worker_handles {
+            worker.abort();
         }
         metrics.buffered_bytes.fetch_sub(held, Ordering::Relaxed);
     });
@@ -1462,7 +1966,7 @@ pub async fn serve_other(
     body: BoxBody,
 ) -> Response<BoxBody> {
     let cap = shared.cfg.max_upload_bytes;
-    let (body, overflow) = if cap > 0 {
+    let (body, upload_state) = if cap > 0 {
         if let Some(n) = declared_len(&headers)
             && n > cap
         {
@@ -1474,13 +1978,18 @@ pub async fn serve_other(
             drop(body);
             return payload_too_large();
         }
-        let overflow = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(UploadState {
+            done: AtomicBool::new(false),
+            overflow: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
         let capped = CappedBody {
             inner: Box::pin(body),
             remaining: cap,
-            overflow: overflow.clone(),
+            state: state.clone(),
+            empty_frames: 0,
         };
-        (capped.boxed(), Some(overflow))
+        (capped.boxed(), Some(state))
     } else {
         (body, None)
     };
@@ -1495,7 +2004,7 @@ pub async fn serve_other(
             return bad_gateway();
         }
     };
-    forward_upload(shared, req, overflow).await
+    forward_upload(shared, req, upload_state).await
 }
 
 /// Forward with an upload-cap tripwire: if the client blew past the cap
@@ -1504,7 +2013,7 @@ pub async fn serve_other(
 async fn forward_upload(
     shared: Shared,
     origin_req: Request<BoxBody>,
-    overflow: Option<Arc<AtomicBool>>,
+    upload_state: Option<Arc<UploadState>>,
 ) -> Response<BoxBody> {
     let timeouts = Timeouts::new(shared.cfg.connect_timeout_secs, shared.cfg.timeout_secs);
     let (resp, permit) =
@@ -1514,8 +2023,22 @@ async fn forward_upload(
                 return bad_gateway();
             }
         };
-    if overflow.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
-        return payload_too_large();
+    if let Some(state) = &upload_state {
+        if state.overflow.load(Ordering::Relaxed) {
+            return payload_too_large();
+        }
+        if !state.done.load(Ordering::Relaxed) {
+            let notified = state.notify.notified();
+            if tokio::time::timeout(timeouts.first_byte, notified)
+                .await
+                .is_err()
+            {
+                return bad_gateway();
+            }
+        }
+        if state.overflow.load(Ordering::Relaxed) {
+            return payload_too_large();
+        }
     }
     let (mut parts, body) = resp.into_parts();
     scrub_response_headers(&mut parts.headers);
@@ -1525,7 +2048,7 @@ async fn forward_upload(
         timeouts.chunk,
         shared.metrics.clone(),
         permit,
-        overflow,
+        upload_state,
     );
     Response::from_parts(parts, PipeBody { rx }.boxed())
 }
@@ -1555,11 +2078,75 @@ mod tests {
     }
 
     #[test]
-    fn slice_count_stays_bounded_for_absurd_lengths() {
+    fn absurd_lengths_fall_back_without_allocating_slices() {
         let p = split_slices(0, u64::MAX - 1, 1024);
-        assert!(p.len() <= 1_000_000);
-        assert_eq!(p[0].0, 0);
-        assert_eq!(p[p.len() - 1].1, u64::MAX - 1);
+        assert!(p.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_guard_retains_download_permit_until_drop() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let cancel = CancellationToken::new();
+        let response = guard_response(Response::new(empty_body()), permit, cancel.clone());
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(response);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn validates_slice_range_and_validator() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 10-19/100"),
+        );
+        headers.insert(http::header::ETAG, HeaderValue::from_static("\"v1\""));
+        let validator = strong_validator(&headers);
+        assert!(valid_slice_response(
+            &headers,
+            10,
+            19,
+            100,
+            validator.as_ref()
+        ));
+        assert!(!valid_slice_response(
+            &headers,
+            11,
+            19,
+            100,
+            validator.as_ref()
+        ));
+        assert!(!valid_slice_response(
+            &headers,
+            10,
+            19,
+            101,
+            validator.as_ref()
+        ));
+    }
+
+    #[test]
+    fn scrubs_all_connection_listed_response_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static("X-First"),
+        );
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static("X-Second"),
+        );
+        headers.insert("x-first", HeaderValue::from_static("secret"));
+        headers.insert("x-second", HeaderValue::from_static("secret"));
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        headers.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+        scrub_response_headers(&mut headers);
+        assert!(!headers.contains_key("x-first"));
+        assert!(!headers.contains_key("x-second"));
+        assert!(!headers.contains_key("keep-alive"));
+        assert!(!headers.contains_key("proxy-connection"));
     }
 
     #[test]
@@ -1837,6 +2424,7 @@ mod integration {
                                     return Ok(Response::builder()
                                         .status(StatusCode::OK)
                                         .header(http::header::CONTENT_LENGTH, origin.data.len())
+                                        .header(http::header::ETAG, "\"fixture-v1\"")
                                         .body(Full::new(origin.data.clone()))
                                         .unwrap());
                                 }
@@ -1855,13 +2443,16 @@ mod integration {
                                     )
                                     .header(http::header::CONTENT_LENGTH, chunk.len())
                                     .header(http::header::ACCEPT_RANGES, "bytes")
+                                    .header(http::header::ETAG, "\"fixture-v1\"")
                                     .body(Full::new(chunk))
                                     .unwrap());
                             }
                             Ok(Response::builder()
                                 .status(StatusCode::OK)
                                 .header(http::header::CONTENT_LENGTH, origin.data.len())
+                                .header(http::header::ETAG, "\"fixture-v1\"")
                                 .header(http::header::ACCEPT_RANGES, "bytes")
+                                .header(http::header::ETAG, "\"fixture-v1\"")
                                 .body(Full::new(origin.data.clone()))
                                 .unwrap())
                         }
@@ -1888,6 +2479,8 @@ mod integration {
             no_hedge: false,
             tunnel_only: false,
             ca_out: None,
+            max_connections: 32,
+            max_tunnels: 8,
             max_downloads: 4,
             max_origin_connections: 32,
             header_timeout_secs: 5,
@@ -1907,6 +2500,9 @@ mod integration {
             cfg: Arc::new(cfg),
             ca: None,
             downloads: Arc::new(Semaphore::new(4)),
+            connections: Arc::new(Semaphore::new(32)),
+            tunnels: Arc::new(Semaphore::new(8)),
+            upgrades: Arc::new(tokio_util::task::TaskTracker::new()),
             allowed_ports: Arc::new(ports.clone()),
             mitm_ports: Arc::new(ports),
             metrics: Arc::new(Metrics::default()),
@@ -2185,14 +2781,14 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn serves_not_modified_from_cache_without_origin() {
+    async fn conditional_requests_are_revalidated_by_origin() {
         let shared = test_shared();
         // Unroutable on purpose: a cache hit must never dial.
         let uri: Uri = "http://127.0.0.1:9/no-origin".parse().unwrap();
         let mut origin_headers = HeaderMap::new();
         origin_headers.insert(http::header::ETAG, HeaderValue::from_static("\"v1\""));
         shared.probe_cache.put(
-            cache_key(&uri, None, None),
+            cache_key(&uri, &HeaderMap::new()),
             ProbeSnapshot {
                 total: 100,
                 range_ok: true,
@@ -2207,8 +2803,9 @@ mod integration {
             HeaderValue::from_static("\"v1\""),
         );
         let resp = serve_get(shared.clone(), uri.clone(), req_headers, None).await;
-        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
-        // A Range alongside the conditional must not win: still 304.
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // A Range alongside the conditional is forwarded with the full
+        // precondition set rather than synthesized from cached metadata.
         let mut req_headers = HeaderMap::new();
         req_headers.insert(
             http::header::IF_NONE_MATCH,
@@ -2221,7 +2818,7 @@ mod integration {
             Some(HeaderValue::from_static("bytes=0-10")),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

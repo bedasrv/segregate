@@ -4,19 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
-hyper-rustls = { version = "0.27", features = ["native-tokio", "http1", "http2", "webpki-roots"] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12", "webpki-roots"] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
-tokio-rustls = "0.26"
-rustls = "0.23"
-rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
