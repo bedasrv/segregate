@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use http::{HeaderMap, Uri};
@@ -12,7 +12,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::cert::CaAuthority;
 use crate::config::Config;
-use crate::segment::{BoxBody, ProxyClient};
+use crate::segment::{BoxBody, EgressClient, ProxyClient};
 
 /// Process-wide shared context. Cloned per connection/request; everything
 /// inside is either immutable or lock-free, except the probe cache (short
@@ -33,42 +33,356 @@ pub struct Shared {
     pub started: Instant,
 }
 
-/// Origin client with a process-wide cap on concurrent origin exchanges.
+/// One origin egress. The global semaphore bounds all active origin streams;
+/// each route additionally has its own active-stream quota.
+struct EgressRoute {
+    name: String,
+    interface: Option<String>,
+    weight: u32,
+    client: ProxyClient,
+    sem: Arc<Semaphore>,
+    health: Mutex<RouteHealth>,
+    requests: AtomicU64,
+    errors: AtomicU64,
+    retries: AtomicU64,
+    failure_threshold: u32,
+    cooldown: Duration,
+    retry_budget: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RouteHealth {
+    healthy: bool,
+    consecutive_failures: u32,
+    retry_tokens: u32,
+    last_failure: Option<Instant>,
+}
+
+impl EgressRoute {
+    fn new(
+        client: EgressClient,
+        max_connections: usize,
+        failure_threshold: u32,
+        cooldown: Duration,
+        retry_budget: u32,
+    ) -> Self {
+        let retry_budget = retry_budget.max(1);
+        Self {
+            name: client.name,
+            interface: client.interface,
+            weight: client.weight.max(1),
+            client: client.client,
+            sem: Arc::new(Semaphore::new(max_connections.max(1))),
+            health: Mutex::new(RouteHealth {
+                healthy: true,
+                consecutive_failures: 0,
+                retry_tokens: retry_budget,
+                last_failure: None,
+            }),
+            requests: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            retries: AtomicU64::new(0),
+            failure_threshold: failure_threshold.max(1),
+            cooldown,
+            retry_budget,
+        }
+    }
+
+    fn health(&self) -> std::sync::MutexGuard<'_, RouteHealth> {
+        self.health
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Cooldown recovery is deliberately passive: a route becomes eligible
+    /// again after a quiet period, and the next exchange verifies it by
+    /// succeeding. A route with a recent transport failure is temporarily
+    /// removed from selection even if it has not yet reached the unhealthy
+    /// threshold, which makes the next bounded retry prefer a different path.
+    /// No background probe can consume origin permits or send unrequested
+    /// traffic.
+    fn available(&self) -> bool {
+        let mut health = self.health();
+        if let Some(last) = health.last_failure {
+            if last.elapsed() < self.cooldown {
+                return false;
+            }
+            health.healthy = true;
+            health.consecutive_failures = 0;
+            health.retry_tokens = self.retry_budget;
+            health.last_failure = None;
+        }
+        health.healthy
+    }
+
+    fn mark_success(&self) {
+        let mut health = self.health();
+        let was_healthy = health.healthy;
+        health.healthy = true;
+        health.consecutive_failures = 0;
+        health.retry_tokens = self.retry_budget;
+        health.last_failure = None;
+        if !was_healthy {
+            tracing::info!(egress = %self.name, "egress recovered");
+        }
+    }
+
+    fn mark_failure(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        let mut health = self.health();
+        if health.consecutive_failures > 0 {
+            self.retries.fetch_add(1, Ordering::Relaxed);
+        }
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        health.retry_tokens = health.retry_tokens.saturating_sub(1);
+        health.last_failure = Some(Instant::now());
+        if health.consecutive_failures >= self.failure_threshold || health.retry_tokens == 0 {
+            if health.healthy {
+                tracing::warn!(
+                    egress = %self.name,
+                    consecutive_failures = health.consecutive_failures,
+                    cooldown_secs = self.cooldown.as_secs(),
+                    "egress entered cooldown"
+                );
+            }
+            health.healthy = false;
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.health().healthy
+    }
+}
+
+/// A global origin permit plus the selected egress quota. Dropping an
+/// unsettled permit marks a transport failure, which covers callers whose
+/// outer timeout cancels an in-flight `Origin::get` future.
+pub struct OriginPermit {
+    _global: OwnedSemaphorePermit,
+    route: Arc<EgressRoute>,
+    _route: OwnedSemaphorePermit,
+    settled: bool,
+}
+
+impl OriginPermit {
+    pub fn interface(&self) -> Option<&str> {
+        self.route.interface.as_deref()
+    }
+
+    pub fn mark_success(&mut self) {
+        if !self.settled {
+            self.route.mark_success();
+            self.settled = true;
+        }
+    }
+
+    pub fn mark_failure(&mut self) {
+        if !self.settled {
+            self.route.mark_failure();
+            self.settled = true;
+        }
+    }
+}
+
+impl Drop for OriginPermit {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.route.mark_failure();
+        }
+    }
+}
+
+/// Origin client pool with a process-wide cap and optional weighted egresses.
 /// Permits are held for the whole body lifetime, so the count tracks live
 /// TCP streams, not just inflight headers.
 #[derive(Clone)]
 pub struct Origin {
-    client: ProxyClient,
+    routes: Arc<Vec<Arc<EgressRoute>>>,
     sem: Arc<Semaphore>,
+    cursor: Arc<AtomicU64>,
 }
 
 impl Origin {
     pub fn new(client: ProxyClient, max_connections: usize) -> Self {
+        Self::with_routes(
+            vec![EgressClient {
+                name: "default".to_owned(),
+                interface: None,
+                weight: 1,
+                client,
+            }],
+            max_connections,
+            max_connections,
+            2,
+            Duration::from_secs(30),
+            2,
+        )
+    }
+
+    /// Build a weighted origin pool. `egress_max_connections == 0` means each
+    /// route gets the same quota as the global cap.
+    pub fn with_routes(
+        clients: Vec<EgressClient>,
+        max_connections: usize,
+        egress_max_connections: usize,
+        failure_threshold: u32,
+        cooldown: Duration,
+        retry_budget: u32,
+    ) -> Self {
+        let route_quota = if egress_max_connections == 0 {
+            max_connections
+        } else {
+            egress_max_connections
+        };
+        let routes = clients
+            .into_iter()
+            .map(|client| {
+                Arc::new(EgressRoute::new(
+                    client,
+                    route_quota,
+                    failure_threshold,
+                    cooldown,
+                    retry_budget,
+                ))
+            })
+            .collect();
         Self {
-            client,
+            routes: Arc::new(routes),
             sem: Arc::new(Semaphore::new(max_connections.max(1))),
+            cursor: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Acquire one active-origin permit for raw CONNECT tunnels.
-    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, OriginError> {
-        self.sem
+    fn select_route(&self) -> Arc<EgressRoute> {
+        let available: Vec<&Arc<EgressRoute>> = self
+            .routes
+            .iter()
+            .filter(|route| route.available())
+            .collect();
+        let candidates = if available.is_empty() {
+            self.routes.iter().collect()
+        } else {
+            available
+        };
+        let total = candidates
+            .iter()
+            .map(|route| route.weight as u64)
+            .sum::<u64>()
+            .max(1);
+        let mut point = self.cursor.fetch_add(1, Ordering::Relaxed) % total;
+        for route in &candidates {
+            let weight = route.weight as u64;
+            if point < weight {
+                return Arc::clone(route);
+            }
+            point -= weight;
+        }
+        candidates
+            .first()
+            .map(|route| Arc::clone(route))
+            .expect("Origin must contain at least one route")
+    }
+
+    async fn acquire_route(&self) -> Result<(Arc<EgressRoute>, OriginPermit), OriginError> {
+        // Prefer a non-full route so one saturated interface cannot head-of-
+        // line block all other egresses. If all are full, wait on one route.
+        for _ in 0..self.routes.len() {
+            let route = self.select_route();
+            let Ok(route_permit) = route.sem.clone().try_acquire_owned() else {
+                continue;
+            };
+            let global_permit = self
+                .sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| OriginError::PoolClosed)?;
+            route.requests.fetch_add(1, Ordering::Relaxed);
+            return Ok((
+                route.clone(),
+                OriginPermit {
+                    _global: global_permit,
+                    route,
+                    _route: route_permit,
+                    settled: false,
+                },
+            ));
+        }
+        let route = self.select_route();
+        let route_permit = route
+            .sem
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| OriginError::PoolClosed)
+            .map_err(|_| OriginError::PoolClosed)?;
+        let global_permit = self
+            .sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| OriginError::PoolClosed)?;
+        route.requests.fetch_add(1, Ordering::Relaxed);
+        Ok((
+            route.clone(),
+            OriginPermit {
+                _global: global_permit,
+                route,
+                _route: route_permit,
+                settled: false,
+            },
+        ))
     }
 
-    /// One origin exchange: acquires a pool permit (times out via the
-    /// caller's `timeout`, counting as a transient failure) and issues the
-    /// request. Hold the permit while streaming the body.
+    /// Acquire one active-origin permit for raw CONNECT tunnels.
+    pub async fn acquire(&self) -> Result<OriginPermit, OriginError> {
+        self.acquire_route().await.map(|(_, permit)| permit)
+    }
+
+    /// One origin exchange: acquires a global and route permit, then issues
+    /// the request. Hold the permit while streaming the body.
     pub async fn get(
         &self,
         req: Request<BoxBody>,
-    ) -> Result<(Response<Incoming>, OwnedSemaphorePermit), OriginError> {
-        let permit = self.acquire().await?;
-        let resp = self.client.request(req).await.map_err(OriginError::Hyper)?;
-        Ok((resp, permit))
+    ) -> Result<(Response<Incoming>, OriginPermit), OriginError> {
+        let (route, mut permit) = self.acquire_route().await?;
+        match route.client.request(req).await {
+            Ok(response) => {
+                permit.mark_success();
+                Ok((response, permit))
+            }
+            Err(error) => {
+                permit.mark_failure();
+                Err(OriginError::Hyper(error))
+            }
+        }
+    }
+
+    /// Small operator-facing route snapshot, included in `/__stats`.
+    pub fn egress_json(&self) -> String {
+        self.routes
+            .iter()
+            .map(|route| {
+                let name = route
+                    .name
+                    .chars()
+                    .map(|c| match c {
+                        '"' | '\\' => '_',
+                        c if c.is_control() => '_',
+                        c => c,
+                    })
+                    .collect::<String>();
+                format!(
+                    "{{\"name\":\"{name}\",\"weight\":{},\"healthy\":{},\"available\":{},\"requests\":{},\"transport_errors\":{},\"retries\":{}}}",
+                    route.weight,
+                    route.is_healthy(),
+                    route.available(),
+                    route.requests.load(Ordering::Relaxed),
+                    route.errors.load(Ordering::Relaxed),
+                    route.retries.load(Ordering::Relaxed),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -400,10 +714,10 @@ pub fn sample_hit(n: u64, each: u64) -> bool {
 }
 
 impl Metrics {
-    pub fn render_json(&self, uptime_secs: u64) -> String {
+    pub fn render_json_with_egress(&self, uptime_secs: u64, egress_json: &str) -> String {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         format!(
-            "{{\"downloads\":{},\"bytes_out\":{},\"buffered_bytes\":{},\"origin_retries\":{},\"hedges\":{},\"truncations\":{},\"cache_hits\":{},\"refused\":{},\"connect_errors\":{},\"uptime_secs\":{}}}",
+            "{{\"downloads\":{},\"bytes_out\":{},\"buffered_bytes\":{},\"origin_retries\":{},\"hedges\":{},\"truncations\":{},\"cache_hits\":{},\"refused\":{},\"connect_errors\":{},\"uptime_secs\":{},\"egress\":[{egress_json}]}}",
             load(&self.downloads),
             load(&self.bytes_out),
             load(&self.buffered_bytes),
@@ -781,11 +1095,42 @@ mod tests {
         let _ = leader.await;
     }
 
+    #[tokio::test]
+    async fn egress_stats_track_route_exchanges() {
+        let clients = vec![
+            EgressClient {
+                name: "primary".to_owned(),
+                interface: None,
+                weight: 3,
+                client: crate::segment::build_client(None, 4).unwrap(),
+            },
+            EgressClient {
+                name: "backup".to_owned(),
+                interface: None,
+                weight: 1,
+                client: crate::segment::build_client(None, 4).unwrap(),
+            },
+        ];
+        let origin = Origin::with_routes(clients, 4, 2, 2, Duration::from_secs(30), 2);
+        let mut permit = origin.acquire().await.unwrap();
+        permit.mark_failure();
+        drop(permit);
+        let mut permit = origin.acquire().await.unwrap();
+        permit.mark_success();
+        drop(permit);
+        let json = origin.egress_json();
+        assert!(json.contains("\"name\":\"primary\""));
+        assert!(json.contains("\"name\":\"backup\""));
+        assert!(json.contains("\"weight\":3"));
+        assert!(json.contains("\"transport_errors\":1"));
+        assert!(json.contains("\"requests\":1"));
+    }
+
     #[test]
     fn metrics_renders_json() {
         let m = Metrics::default();
         m.downloads.fetch_add(3, Ordering::Relaxed);
-        let json = m.render_json(7);
+        let json = m.render_json_with_egress(7, "[]");
         assert!(json.contains("\"downloads\":3") && json.contains("\"uptime_secs\":7"));
         assert!(json.contains("\"buffered_bytes\":0"));
     }

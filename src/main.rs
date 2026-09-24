@@ -48,8 +48,31 @@ async fn main() -> std::io::Result<()> {
         state::parse_connect_ports(&cfg.allow_connect_ports).map_err(std::io::Error::other)?;
     let mitm_ports = state::parse_connect_ports(&cfg.mitm_ports).map_err(std::io::Error::other)?;
 
-    let client = segment::build_client(cfg.origin_ca_bundle.as_deref(), cfg.max_origin_connections)
-        .map_err(std::io::Error::other)?;
+    let egress_clients = segment::build_egress_clients(
+        cfg.origin_ca_bundle.as_deref(),
+        cfg.max_origin_connections,
+        &cfg.egress_routes,
+    )
+    .map_err(std::io::Error::other)?;
+    let origin = if egress_clients.is_empty() {
+        let client =
+            segment::build_client(cfg.origin_ca_bundle.as_deref(), cfg.max_origin_connections)
+                .map_err(std::io::Error::other)?;
+        state::Origin::new(client, cfg.max_origin_connections)
+    } else {
+        tracing::info!(
+            routes = egress_clients.len(),
+            "weighted origin egress pool enabled"
+        );
+        state::Origin::with_routes(
+            egress_clients,
+            cfg.max_origin_connections,
+            cfg.egress_max_connections,
+            cfg.egress_failure_threshold,
+            Duration::from_secs(cfg.egress_cooldown_secs),
+            cfg.egress_retry_budget,
+        )
+    };
 
     // Persistent CA for the process lifetime (immutable → plain Arc sharing).
     // Skipped only when MITM is disabled; CONNECT then falls back to tunnels.
@@ -66,7 +89,7 @@ async fn main() -> std::io::Result<()> {
     };
 
     let shared = state::Shared {
-        origin: state::Origin::new(client, cfg.max_origin_connections),
+        origin,
         cfg: Arc::new(cfg.clone()),
         ca,
         downloads: Arc::new(Semaphore::new(cfg.max_downloads.max(1))),

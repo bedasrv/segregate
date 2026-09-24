@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,18 +11,28 @@ use http_body::Frame;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
+use hyper_util::client::legacy::connect::HttpConnector;
 use tokio::sync::{OwnedSemaphorePermit, watch};
 use tokio_util::sync::CancellationToken;
 
 use tracing::Instrument;
 
-use crate::state::{Metrics, Origin, OriginError, ProbeSnapshot, Shared, cache_key, sample_hit};
+use crate::state::{
+    Metrics, Origin, OriginError, OriginPermit, ProbeSnapshot, Shared, cache_key, sample_hit,
+};
 
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
-pub type ProxyClient = hyper_util::client::legacy::Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    BoxBody,
->;
+pub type ProxyClient =
+    hyper_util::client::legacy::Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody>;
+
+/// One configured origin client. The route name is an interface name for
+/// normal entries; the special `default` name uses the system-selected route.
+pub struct EgressClient {
+    pub name: String,
+    pub interface: Option<String>,
+    pub weight: u32,
+    pub client: ProxyClient,
+}
 
 /// Split time budget: time-to-first-byte (dial, TLS, headers) versus idle
 /// gaps between body chunks. One knob for both either false-retries
@@ -56,7 +66,19 @@ impl Timeouts {
 /// number of idle FDs across many distinct origins.
 pub fn build_client(
     ca_bundle: Option<&std::path::Path>,
+    pool_max_idle_per_host: usize,
+) -> Result<ProxyClient, String> {
+    build_client_on_interface(ca_bundle, pool_max_idle_per_host, None)
+}
+
+/// Build a client whose sockets are optionally bound to one interface.
+///
+/// Interface binding is platform-specific inside `hyper-util`; on Linux it
+/// uses `SO_BINDTODEVICE` and may therefore require elevated privileges.
+pub fn build_client_on_interface(
+    ca_bundle: Option<&std::path::Path>,
     _pool_max_idle_per_host: usize,
+    interface: Option<&str>,
 ) -> Result<ProxyClient, String> {
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
@@ -92,11 +114,49 @@ pub fn build_client(
     let tls = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    let mut http = HttpConnector::new();
+    // The HTTPS wrapper accepts both `http` and `https` URIs; the low-level
+    // connector must therefore not reject HTTPS before the wrapper sees it.
+    http.enforce_http(false);
+    if let Some(interface) = interface {
+        #[cfg(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        ))]
+        {
+            http.set_interface(interface);
+        }
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        )))]
+        {
+            return Err(format!(
+                "origin interface binding is unsupported on this platform: {interface}"
+            ));
+        }
+    }
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls)
         .https_or_http()
         .enable_http1()
-        .build();
+        .wrap_connector(http);
     Ok(
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             // No idle pool: Hyper's pool budget is per authority, while this
@@ -107,6 +167,72 @@ pub fn build_client(
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build(connector),
     )
+}
+
+/// Parse the compact weighted route syntax used by `--egress-routes`.
+///
+/// Empty input keeps the ordinary system-route client. `default=weight` is
+/// also accepted when an operator wants an explicitly weighted single route.
+pub fn parse_egress_routes(routes: &str) -> Result<Vec<(String, u32)>, String> {
+    if routes.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen = HashSet::new();
+    let mut parsed = Vec::new();
+    for raw in routes.split(',') {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            return Err("egress route list contains an empty entry".to_owned());
+        }
+        let (name, weight) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("invalid egress route {entry:?}; expected NAME=WEIGHT"))?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("egress route name cannot be empty".to_owned());
+        }
+        if name
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '=')
+        {
+            return Err(format!("invalid egress route name {name:?}"));
+        }
+        if !seen.insert(name.to_owned()) {
+            return Err(format!("duplicate egress route {name:?}"));
+        }
+        let weight = weight
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("invalid weight for egress route {name:?}"))?;
+        if !(1..=1000).contains(&weight) {
+            return Err(format!("egress route {name:?} weight must be 1..=1000"));
+        }
+        parsed.push((name.to_owned(), weight));
+    }
+    Ok(parsed)
+}
+
+/// Build one origin client per weighted interface route. An empty route list
+/// intentionally returns no clients so startup can use the legacy single
+/// client path.
+pub fn build_egress_clients(
+    ca_bundle: Option<&std::path::Path>,
+    pool_max_idle_per_host: usize,
+    routes: &str,
+) -> Result<Vec<EgressClient>, String> {
+    parse_egress_routes(routes)?
+        .into_iter()
+        .map(|(name, weight)| {
+            let interface = (name != "default").then_some(name.as_str());
+            let client = build_client_on_interface(ca_bundle, pool_max_idle_per_host, interface)?;
+            Ok(EgressClient {
+                interface: interface.map(str::to_owned),
+                name,
+                weight,
+                client,
+            })
+        })
+        .collect()
 }
 
 /// Empty body with the proxy's error type (`Empty::boxed()` is `Infallible`).
@@ -468,7 +594,7 @@ async fn origin_fetch(
     headers: &[(HeaderName, HeaderValue)],
     range: Option<(u64, u64)>,
     timeouts: Timeouts,
-) -> Result<(Response<Incoming>, OwnedSemaphorePermit), FetchFail> {
+) -> Result<(Response<Incoming>, OriginPermit), FetchFail> {
     let req = build_origin_request(method, uri, headers, range).map_err(|e| {
         tracing::debug!(error = ?e, uri = %redact_uri(uri), "origin request build failed");
         FetchFail::Transport
@@ -1413,7 +1539,7 @@ fn pump_incoming(
     depth: usize,
     timeout: Duration,
     metrics: Arc<Metrics>,
-    permit: OwnedSemaphorePermit,
+    permit: OriginPermit,
     abort: Option<Arc<UploadState>>,
 ) -> tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, hyper::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel(depth);
@@ -1497,7 +1623,7 @@ async fn passthrough(shared: Shared, origin_req: Request<BoxBody>) -> Response<B
 fn stream_passthrough(
     shared: Shared,
     response: hyper::Response<Incoming>,
-    permit: OwnedSemaphorePermit,
+    permit: OriginPermit,
 ) -> Response<BoxBody> {
     let timeouts = Timeouts::new(shared.cfg.connect_timeout_secs, shared.cfg.timeout_secs);
     let (mut parts, body) = response.into_parts();
@@ -2058,6 +2184,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_weighted_egress_routes() {
+        assert_eq!(
+            parse_egress_routes("eth0=4,wg0=1"),
+            Ok(vec![("eth0".to_owned(), 4), ("wg0".to_owned(), 1)])
+        );
+        assert!(parse_egress_routes("eth0=0,wg0=1").is_err());
+        assert!(parse_egress_routes("eth0=1,eth0=2").is_err());
+        assert!(parse_egress_routes("eth0").is_err());
+    }
+
+    #[test]
     fn slices_evenly_with_remainder() {
         assert_eq!(
             split_slices(0, 99, 25),
@@ -2483,6 +2620,11 @@ mod integration {
             max_tunnels: 8,
             max_downloads: 4,
             max_origin_connections: 32,
+            egress_routes: String::new(),
+            egress_max_connections: 0,
+            egress_failure_threshold: 2,
+            egress_cooldown_secs: 30,
+            egress_retry_budget: 2,
             header_timeout_secs: 5,
             probe_cache_ttl_secs: 0,
             probe_cache_entries: 8,

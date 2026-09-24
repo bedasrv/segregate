@@ -207,9 +207,10 @@ pub async fn handle(
     // Operator endpoint, only for requests addressed to the proxy itself
     // (origin-form, no scheme). Absolute-form proxy traffic is never hijacked.
     if parts.method == Method::GET && uri.scheme().is_none() && uri.path() == "/__stats" {
-        let json = shared
-            .metrics
-            .render_json(shared.started.elapsed().as_secs());
+        let json = shared.metrics.render_json_with_egress(
+            shared.started.elapsed().as_secs(),
+            &shared.origin.egress_json(),
+        );
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(http::header::CONTENT_TYPE, "application/json")
@@ -341,6 +342,60 @@ fn connect_timeout(shared: &Shared) -> Duration {
     Duration::from_secs(shared.cfg.connect_timeout_secs.max(1))
 }
 
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+async fn connect_origin_socket(
+    authority: &str,
+    interface: Option<&str>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let Some(interface) = interface else {
+        return tokio::net::TcpStream::connect(authority).await;
+    };
+    let mut last_error = None;
+    for addr in tokio::net::lookup_host(authority).await? {
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        };
+        let socket = match socket {
+            Ok(socket) => socket,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        if let Err(error) = socket.bind_device(Some(interface.as_bytes())) {
+            last_error = Some(error);
+            continue;
+        }
+        match socket.connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no origin address")
+    }))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+async fn connect_origin_socket(
+    authority: &str,
+    interface: Option<&str>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    // `hyper-util` supports additional interface-binding platforms, but
+    // Tokio's raw socket API used for CONNECT currently exposes bind_device
+    // only on the targets above. Refuse an explicitly requested route rather
+    // than silently sending the tunnel through a different interface.
+    if let Some(interface) = interface {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("CONNECT interface binding is unsupported on this platform: {interface}"),
+        ));
+    }
+    tokio::net::TcpStream::connect(authority).await
+}
+
 /// Plain TCP tunnel for CONNECT when MITM is disabled. The dial has the
 /// same timeout as origin exchanges so blackholed routes fail fast.
 async fn tunnel(
@@ -355,17 +410,31 @@ async fn tunnel(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "CONNECT upgrade timeout"))?
         .map_err(std::io::Error::other)?;
     let mut up = TokioIo::new(upgraded);
-    let _origin_permit = tokio::time::timeout(connect_timeout(shared), shared.origin.acquire())
+    let mut origin_permit = tokio::time::timeout(connect_timeout(shared), shared.origin.acquire())
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "origin permit timeout"))?
         .map_err(|error| std::io::Error::other(format!("origin permit: {error:?}")))?;
-    let mut origin = tokio::time::timeout(
+    let interface = origin_permit.interface().map(str::to_owned);
+    let mut origin = match tokio::time::timeout(
         connect_timeout(shared),
-        tokio::net::TcpStream::connect(authority),
+        connect_origin_socket(authority, interface.as_deref()),
     )
     .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "origin connect timeout"))?
-    .map_err(std::io::Error::other)?;
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            origin_permit.mark_failure();
+            return Err(std::io::Error::other(error));
+        }
+        Err(error) => {
+            origin_permit.mark_failure();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("origin connect timeout: {error}"),
+            ));
+        }
+    };
+    origin_permit.mark_success();
     tokio::io::copy_bidirectional(&mut up, &mut origin).await?;
     Ok(())
 }
@@ -536,6 +605,11 @@ mod tests {
                 max_tunnels: 8,
                 max_downloads: 4,
                 max_origin_connections: 8,
+                egress_routes: String::new(),
+                egress_max_connections: 0,
+                egress_failure_threshold: 2,
+                egress_cooldown_secs: 30,
+                egress_retry_budget: 2,
                 header_timeout_secs: 5,
                 probe_cache_ttl_secs: 0,
                 probe_cache_entries: 8,

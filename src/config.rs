@@ -76,6 +76,27 @@ pub struct Config {
     #[arg(long, default_value_t = 64)]
     pub max_origin_connections: usize,
 
+    /// Weighted origin egress routes, e.g. `eth0=4,wg0=1`.
+    /// Empty preserves the default system route.
+    #[arg(long, default_value = "")]
+    pub egress_routes: String,
+
+    /// Per-egress active connection quota; 0 uses max-origin-connections.
+    #[arg(long, default_value_t = 0)]
+    pub egress_max_connections: usize,
+
+    /// Consecutive transport failures before an egress enters cooldown.
+    #[arg(long, default_value_t = 2)]
+    pub egress_failure_threshold: u32,
+
+    /// Cooldown before an unhealthy egress becomes eligible again.
+    #[arg(long, default_value_t = 30)]
+    pub egress_cooldown_secs: u64,
+
+    /// Transport failures allowed per egress before cooldown.
+    #[arg(long, default_value_t = 2)]
+    pub egress_retry_budget: u32,
+
     /// Max seconds to receive downstream request headers before closing
     #[arg(long, default_value_t = 10)]
     pub header_timeout_secs: u64,
@@ -171,6 +192,32 @@ impl Config {
             4096,
             "max_origin_connections",
         );
+        if self.egress_max_connections > 0 {
+            clamp(
+                &mut self.egress_max_connections,
+                1,
+                4096,
+                "egress_max_connections",
+            );
+        }
+        clamp(
+            &mut self.egress_failure_threshold,
+            1,
+            1000,
+            "egress_failure_threshold",
+        );
+        clamp(
+            &mut self.egress_cooldown_secs,
+            1,
+            3600,
+            "egress_cooldown_secs",
+        );
+        clamp(
+            &mut self.egress_retry_budget,
+            1,
+            1000,
+            "egress_retry_budget",
+        );
         clamp(&mut self.header_timeout_secs, 0, 300, "header_timeout_secs");
         clamp(
             &mut self.probe_cache_ttl_secs,
@@ -258,6 +305,11 @@ mod tests {
             max_tunnels: 0,
             max_downloads: 0,
             max_origin_connections: 0,
+            egress_routes: String::new(),
+            egress_max_connections: 0,
+            egress_failure_threshold: 0,
+            egress_cooldown_secs: 0,
+            egress_retry_budget: 0,
             header_timeout_secs: 9999,
             probe_cache_ttl_secs: 0,
             probe_cache_entries: 0,
@@ -277,6 +329,10 @@ mod tests {
         assert_eq!(cfg.max_connections, 1);
         assert_eq!(cfg.max_tunnels, 1);
         assert_eq!(cfg.max_downloads, 1);
+        assert_eq!(cfg.egress_max_connections, 0);
+        assert_eq!(cfg.egress_failure_threshold, 1);
+        assert_eq!(cfg.egress_cooldown_secs, 1);
+        assert_eq!(cfg.egress_retry_budget, 1);
         assert_eq!(cfg.slice_bytes, 1024);
     }
 }

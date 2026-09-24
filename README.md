@@ -58,6 +58,19 @@ cargo run --release -- --tunnel-only
   excess gets `503` + `Retry-After` instead of queueing unboundedly.
 - `--max-origin-connections N` (default 64): total concurrent origin
   exchanges and raw CONNECT sockets, including probe/segment/hedge/passthrough.
+- `--egress-routes "eth0=4,wg0=1"`: opt-in weighted origin egress pool.
+  Each name is a network interface passed to `HttpConnector`; `default` uses
+  the system-selected route. The pool is disabled when this is empty.
+- `--egress-max-connections N` (default 0): active-stream quota per egress;
+  0 gives each route the same quota as `--max-origin-connections`. The global
+  origin cap still applies across all routes.
+- `--egress-failure-threshold N` (default 2): consecutive transport failures
+  before an egress is marked unhealthy.
+- `--egress-cooldown-secs S` (default 30): passive health recovery interval;
+  after it, the next exchange verifies the route again.
+- `--egress-retry-budget N` (default 2): consecutive transport failures
+  allowed per egress before it enters cooldown; a successful exchange resets
+  the budget. Segment retries are still bounded by `--max-slice-retries`.
 - `--header-timeout-secs S` (default 10, 0 disables): max time to receive
   downstream request headers before closing (slow-loris bound).
 - `--probe-cache-ttl-secs S` (default 60, 0 disables), `--probe-cache-entries N`
@@ -88,7 +101,10 @@ absurd values fail safe instead of exhausting tasks, channels, or memory.
 `downloads`, `bytes_out`, `buffered_bytes` (completed-but-unflushed slice
 bytes currently held), `origin_retries`, `hedges`, `truncations`,
 `cache_hits`, `refused` (CONNECT-denied + 503-overload),
-`connect_errors`, `uptime_secs`.
+`connect_errors`, `uptime_secs`, and an `egress` array with each configured
+route's weight, health, current availability, request count, transport errors,
+and retry count.
+Interface names are operator labels; `/__stats` does not expose client data.
 
 ## Status codes (and what clients should do)
 
@@ -179,7 +195,13 @@ wget -e use_proxy=yes -e http_proxy=127.0.0.1:8080 --timeout=30 --tries=10 http:
    caps.
 9. Origin connections are HTTP/1.1 only: segmentation needs one TCP
    connection per segment (HTTP/2 would multiplex everything onto one),
-   and plain HTTP/1.1 is accepted by the pickiest WAFs.
+   and plain HTTP/1.1 is accepted by the pickiest WAFs. An optional weighted
+   egress pool gives each configured interface its own connector and active
+   quota. Transport failures consume a bounded per-route budget; unhealthy
+   routes leave the selection set until cooldown recovery, allowing bounded
+   retries to fail over without retrying HTTP status errors. On Linux,
+   interface binding uses `SO_BINDTODEVICE` and may require elevated
+   privileges.
 
 ## Tests
 
