@@ -1,0 +1,28 @@
+[package]
+name = "segregate"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+hyper-rustls = { version = "0.27", features = ["native-tokio", "http1", "http2", "webpki-roots"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rcgen = "0.13"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# A shipped proxy binary: trade slower builds for throughput and size.
+lto = true
+codegen-units = 1
+strip = true
