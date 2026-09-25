@@ -599,7 +599,9 @@ async fn origin_fetch(
         tracing::debug!(error = ?e, uri = %redact_uri(uri), "origin request build failed");
         FetchFail::Transport
     })?;
-    let (resp, permit) = tokio::time::timeout(timeouts.first_byte, origin.get(req))
+    let expected = range.map_or(0, |(start, end)| end.saturating_sub(start) + 1);
+    let (resp, permit) =
+        tokio::time::timeout(timeouts.first_byte, origin.get_sized(req, expected))
         .await
         .map_err(|_| FetchFail::Timeout)?
         .map_err(|e| {
@@ -778,9 +780,12 @@ async fn hedge_first_bytes(ctx: HedgeBytes) -> Option<Bytes> {
     let req = build_origin_request(&Method::GET, &uri, &headers, Some((cur, h_end))).ok()?;
     let response = tokio::select! {
         _ = cancel.cancelled() => return None,
-        response = tokio::time::timeout(timeouts.first_byte, origin.get(req)) => response,
+        response = tokio::time::timeout(
+            timeouts.first_byte,
+            origin.get_sized(req, h_end.saturating_sub(cur) + 1),
+        ) => response,
     };
-    let (resp, _permit) = response.ok()?.ok()?;
+    let (resp, mut permit) = response.ok()?.ok()?;
     if resp.status() != StatusCode::PARTIAL_CONTENT
         || !valid_slice_response(resp.headers(), cur, h_end, total, validator.as_ref())
     {
@@ -798,7 +803,10 @@ async fn hedge_first_bytes(ctx: HedgeBytes) -> Option<Bytes> {
                 match frame.into_data() {
                     // An empty first frame is a stall signal, not data:
                     // fail fast instead of waiting out the budget in a spin.
-                    Ok(data) if !data.is_empty() => return Some(data),
+                    Ok(data) if !data.is_empty() => {
+                        permit.record_bytes(data.len() as u64);
+                        return Some(data);
+                    }
                     _ => return None,
                 }
             }
@@ -819,7 +827,7 @@ struct HedgeRace<'a> {
     headers: &'a [(HeaderName, HeaderValue)],
     old: &'a mut Incoming,
     cur: u64,
-    end: u64,
+    h_end: u64,
     total: u64,
     validator: Option<&'a HeaderValue>,
     cancel: &'a CancellationToken,
@@ -836,13 +844,12 @@ async fn race_hedge(ctx: HedgeRace<'_>) -> HedgeOutcome {
         headers,
         old,
         cur,
-        end,
+        h_end,
         total,
         validator,
         cancel,
         timeouts,
     } = ctx;
-    let h_end = cur.saturating_add(256 * 1024 - 1).min(end);
     let hedge_validator = validator.cloned();
     let mut hedge = tokio::spawn(hedge_first_bytes(HedgeBytes {
         origin: origin.clone(),
@@ -912,6 +919,121 @@ fn split_slices(start: u64, end: u64, mut slice_bytes: u64) -> Vec<(u64, u64)> {
             break;
         }
         cur = slice_end + 1;
+    }
+    out
+}
+
+const MAX_SLICES: u64 = 1_000_000;
+
+fn adaptive_min_bytes(configured: u64, max_bytes: u64) -> u64 {
+    let max_bytes = max_bytes.max(1);
+    if configured == 0 {
+        (max_bytes / 4).max(256 * 1024).min(max_bytes)
+    } else {
+        configured.max(1).min(max_bytes)
+    }
+}
+
+fn static_slice_count(len: u64, max_bytes: u64) -> u64 {
+    len.div_ceil(max_bytes.max(1))
+}
+
+#[derive(Clone, Copy)]
+struct SlicePlanLimits {
+    max_bytes: u64,
+    min_bytes: u64,
+    max_extra_slices: u64,
+}
+
+/// Bounded HFSS-style planning: dispatch progressively smaller ranges while
+/// reserving a small tail for late rebalancing. `--slice-bytes` is always the
+/// hard maximum. If the plan would amplify the static request count by more
+/// than `max_extra_slices`, static slicing wins.
+fn split_adaptive_slices(start: u64, end: u64, limits: SlicePlanLimits) -> Vec<(u64, u64)> {
+    let len = end.saturating_sub(start).saturating_add(1);
+    let max_bytes = limits.max_bytes.max(1);
+    if len == 0 {
+        return Vec::new();
+    }
+    let static_count = static_slice_count(len, max_bytes);
+    let max_count = static_count
+        .saturating_add(limits.max_extra_slices)
+        .min(MAX_SLICES);
+    if max_count == 0 {
+        return Vec::new();
+    }
+    let min_bytes = adaptive_min_bytes(limits.min_bytes, max_bytes);
+    // Ten percent is only useful for small files. On large files an
+    // unbounded tail multiplies request count, so cap it at four bulk ranges.
+    let tail_cap = max_bytes.saturating_mul(4).max(min_bytes);
+    let tail = (len / 10).clamp(min_bytes, tail_cap).min(len);
+    let mut out = Vec::with_capacity((static_count.min(max_count) as usize).max(1));
+    let mut cur = start;
+    while cur <= end && end - cur + 1 > tail && (out.len() as u64) < max_count {
+        let remaining = end - cur + 1;
+        let size = (remaining / 2).clamp(min_bytes, max_bytes);
+        let slice_end = cur.saturating_add(size - 1).min(end);
+        out.push((cur, slice_end));
+        cur = slice_end + 1;
+    }
+    while cur <= end && (out.len() as u64) < max_count {
+        let remaining = end - cur + 1;
+        let size = remaining.min(min_bytes);
+        let slice_end = cur.saturating_add(size - 1).min(end);
+        out.push((cur, slice_end));
+        cur = slice_end + 1;
+    }
+    if cur <= end || out.len() as u64 > max_count {
+        return split_slices(start, end, max_bytes);
+    }
+    out
+}
+
+/// Bounded multi-round DLT planning. Each route's suggested round share is
+/// `rate * tau`, clamped to the configured range bounds; any remainder is
+/// completed by the adaptive tail planner. This is a heuristic because HTTP
+/// servers can throttle a route after the plan is made.
+fn split_dlt_slices(
+    start: u64,
+    end: u64,
+    limits: SlicePlanLimits,
+    rounds: u32,
+    round_ms: u64,
+    rates: &[u64],
+) -> Vec<(u64, u64)> {
+    if start > end || rounds == 0 || rates.is_empty() {
+        return split_adaptive_slices(start, end, limits);
+    }
+    let len = end - start + 1;
+    let max_bytes = limits.max_bytes.max(1);
+    let max_count = static_slice_count(len, max_bytes)
+        .saturating_add(limits.max_extra_slices)
+        .min(MAX_SLICES);
+    let min_bytes = adaptive_min_bytes(limits.min_bytes, max_bytes);
+    let mut out = Vec::new();
+    let mut cur = start;
+    for _ in 0..rounds {
+        for &rate in rates {
+            if cur > end {
+                break;
+            }
+            let size = ((rate as u128).saturating_mul(round_ms as u128) / 1_000)
+                .min(u64::MAX as u128) as u64;
+            let size = size.clamp(min_bytes, max_bytes);
+            let slice_end = cur.saturating_add(size - 1).min(end);
+            out.push((cur, slice_end));
+            cur = slice_end + 1;
+            if out.len() as u64 > max_count {
+                return split_slices(start, end, max_bytes);
+            }
+        }
+    }
+    if cur <= end {
+        let tail = split_adaptive_slices(cur, end, limits);
+        if tail.is_empty() || out.len().saturating_add(tail.len()) as u64 > max_count {
+            return split_slices(start, end, max_bytes);
+        }
+        out.extend(tail);
     }
     out
 }
@@ -1147,6 +1269,9 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
     let mut cur = start;
     let mut fails: u32 = 0;
     let mut backoff = Duration::from_millis(200);
+    let mut progress_window_started = Instant::now();
+    let mut progress_window_bytes = 0u64;
+    let mut slow_progress = false;
     // Reports the slice outcome; the coordinator may already be gone.
     macro_rules! finish {
         ($result:expr) => {{
@@ -1163,15 +1288,26 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
     // counts as a stall, not progress, so a pathological empty-frame
     // stream terminates via the retry cap instead of spinning.
     macro_rules! append {
-        ($data:expr) => {{
+        ($permit:ident, $data:expr) => {{
             let data = fit_to_window($data, cur, end);
             if data.is_empty() {
                 fails += 1;
                 metrics.origin_retries.fetch_add(1, Ordering::Relaxed);
                 break;
             }
+            $permit.record_bytes(data.len() as u64);
             buf.extend_from_slice(&data);
             cur += data.len() as u64;
+            progress_window_bytes = progress_window_bytes.saturating_add(data.len() as u64);
+            let window = progress_window_started.elapsed();
+            if window >= Duration::from_secs(1) {
+                let observed = (progress_window_bytes as u128).saturating_mul(1_000_000_000)
+                    / window.as_nanos().max(1);
+                let expected = $permit.estimated_rate() as u128;
+                slow_progress = expected > 0 && observed.saturating_mul(4) < expected;
+                progress_window_bytes = 0;
+                progress_window_started = Instant::now();
+            }
             progress.notify_one();
             fails = 0;
             backoff = Duration::from_millis(200);
@@ -1215,9 +1351,12 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
         };
         let response = tokio::select! {
             _ = cancel.cancelled() => return,
-            response = tokio::time::timeout(timeouts.first_byte, shared.origin.get(req)) => response,
+            response = tokio::time::timeout(
+                timeouts.first_byte,
+                shared.origin.get_sized(req, end.saturating_sub(cur) + 1),
+            ) => response,
         };
-        let (resp, permit) = match response {
+        let (resp, mut permit) = match response {
             Ok(Ok(x)) => x,
             _ => {
                 fails += 1;
@@ -1259,7 +1398,7 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
                 match frame {
                     Ok(Some(Ok(frame))) if frame.is_data() => match frame.into_data() {
                         Ok(data) => {
-                            if append!(data) {
+                            if append!(permit, data) {
                                 finish!(Ok(buf.freeze()));
                             }
                             hedged = false;
@@ -1277,9 +1416,22 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
                     // Truncated mid-slice or per-chunk timeout.
                     _ => {
                         let remaining = end - cur + 1;
-                        if !hedged && enable_hedge && remaining > 65536 {
+                        let window = progress_window_started.elapsed();
+                        let observed = (progress_window_bytes as u128)
+                            .saturating_mul(1_000_000_000)
+                            / window.as_nanos().max(1);
+                        let estimated = permit.estimated_rate() as u128;
+                        let rate_low = slow_progress
+                            || (estimated > 0
+                                && window >= Duration::from_millis(500)
+                                && observed.saturating_mul(4) < estimated);
+                        if !hedged
+                            && enable_hedge
+                            && remaining > 65536
+                            && (rate_low || estimated == 0)
+                        {
                             hedged = true;
-                            tracing::debug!(cur, end, "stall: racing hedged duplicate");
+                            tracing::debug!(cur, end, rate_low, "stall: racing hedged duplicate");
                             metrics.hedges.fetch_add(1, Ordering::Relaxed);
                             match race_hedge(HedgeRace {
                                 origin: &shared.origin,
@@ -1287,7 +1439,11 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
                                 headers,
                                 old: &mut body,
                                 cur,
-                                end,
+                                h_end: if rate_low {
+                                    end
+                                } else {
+                                    cur.saturating_add(256 * 1024 - 1).min(end)
+                                },
                                 total: *total,
                                 validator: *validator,
                                 cancel,
@@ -1296,10 +1452,13 @@ async fn fetch_slice(job: &SliceFetch<'_>, idx: u64, start: u64, end: u64) {
                             .await
                             {
                                 HedgeOutcome::Progress(data, from_hedge) => {
-                                    if append!(data) {
+                                    if append!(permit, data) {
                                         finish!(Ok(buf.freeze()));
                                     }
                                     if from_hedge {
+                                        if rate_low {
+                                            metrics.work_steals.fetch_add(1, Ordering::Relaxed);
+                                        }
                                         // Stalled body dropped; re-request remainder.
                                         break;
                                     }
@@ -1544,7 +1703,7 @@ fn pump_incoming(
 ) -> tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, hyper::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel(depth);
     tokio::spawn(async move {
-        let _permit = permit; // held for the whole body lifetime
+        let mut permit = permit; // held for the whole body lifetime
         let mut body = body;
         let mut sent: u64 = 0;
         let deadline = Instant::now() + timeout.saturating_mul(4);
@@ -1566,6 +1725,7 @@ fn pump_incoming(
                 Ok(Some(Ok(frame))) if frame.is_data() => match frame.into_data() {
                     Ok(data) => {
                         let n = data.len() as u64;
+                        permit.record_bytes(n);
                         sent += n;
                         match tokio::time::timeout(timeout, tx.send(Ok(Frame::data(data)))).await {
                             Ok(Ok(())) => {
@@ -1667,6 +1827,7 @@ pub async fn serve_get_with_cancel(
     cancel: CancellationToken,
 ) -> Response<BoxBody> {
     shared.metrics.downloads.fetch_add(1, Ordering::Relaxed);
+    let download_started = Instant::now();
     let timeouts = Timeouts::new(shared.cfg.connect_timeout_secs, shared.cfg.timeout_secs);
     let timeout = timeouts.chunk;
     let fwd_probe = segment_headers(&req_headers);
@@ -1847,7 +2008,26 @@ pub async fn serve_get_with_cancel(
         };
         return passthrough(shared, req).await;
     }
-    let slices = split_slices(eff_start, eff_end, shared.cfg.slice_bytes);
+    let planner_workers = shared.cfg.workers.max(1);
+    let limits = SlicePlanLimits {
+        max_bytes: shared.cfg.slice_bytes,
+        min_bytes: shared.cfg.slice_min_bytes,
+        max_extra_slices: (planner_workers as u64).saturating_mul(2),
+    };
+    let slices = if shared.cfg.dlt_rounds > 0 && shared.origin.route_count() > 1 {
+        split_dlt_slices(
+            eff_start,
+            eff_end,
+            limits,
+            shared.cfg.dlt_rounds,
+            shared.cfg.dlt_round_ms,
+            &shared.origin.rate_hints(),
+        )
+    } else if !shared.cfg.adaptive_slices {
+        split_slices(eff_start, eff_end, shared.cfg.slice_bytes)
+    } else {
+        split_adaptive_slices(eff_start, eff_end, limits)
+    };
     if slices.is_empty() {
         let request = match build_origin_request(&Method::GET, &uri, &fwd_probe, None) {
             Ok(request) => request,
@@ -1864,16 +2044,25 @@ pub async fn serve_get_with_cancel(
         };
         return passthrough(shared, req).await;
     }
-    let workers = shared.cfg.workers.max(1).min(slices.len());
+    let workers = planner_workers.min(slices.len());
     if eff_start == 0 && downstream_range.is_none() && workers > 1 {
         // Validate the first real range before fanning out. If the origin
         // ignores Range, switch to one linear full-body response immediately
         // instead of letting every worker discard a growing prefix.
-        let first_end = shared.cfg.slice_bytes.saturating_sub(1).min(eff_end);
+        let first_end = slices
+            .first()
+            .map(|(_, end)| *end)
+            .unwrap_or(eff_end)
+            .min(eff_end);
         if let Ok(request) =
             build_origin_request(&Method::GET, &uri, &fwd_parts, Some((eff_start, first_end)))
         {
-            match tokio::time::timeout(timeouts.first_byte, shared.origin.get(request)).await {
+            match tokio::time::timeout(
+                timeouts.first_byte,
+                shared.origin.get_sized(request, first_end - eff_start + 1),
+            )
+            .await
+            {
                 Ok(Ok((response, permit))) if response.status() == StatusCode::OK => {
                     return stream_passthrough(shared, response, permit);
                 }
@@ -1966,6 +2155,7 @@ pub async fn serve_get_with_cancel(
         // Completed-but-unflushed bytes currently held; subtracted once on
         // exit so the gauge never leaks, however the task ends.
         let mut held = 0u64;
+        let mut complete = false;
         let mut pending: HashMap<u64, SliceResult> = HashMap::new();
         enum Wait {
             Progress,
@@ -1974,6 +2164,7 @@ pub async fn serve_get_with_cancel(
         }
         loop {
             if need >= total_slices {
+                complete = true;
                 break;
             }
             if let Some(res) = pending.remove(&need) {
@@ -2040,6 +2231,16 @@ pub async fn serve_get_with_cancel(
         }
         for worker in &worker_handles {
             worker.abort();
+        }
+        if complete {
+            let elapsed = download_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            metrics.completed_downloads.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .download_ms_total
+                .fetch_add(elapsed, Ordering::Relaxed);
+            metrics
+                .download_ms_max
+                .fetch_max(elapsed, Ordering::Relaxed);
         }
         metrics.buffered_bytes.fetch_sub(held, Ordering::Relaxed);
     });
@@ -2211,6 +2412,89 @@ mod tests {
         // Contiguous, no gaps or overlaps.
         for w in p.windows(2) {
             assert_eq!(w[0].1 + 1, w[1].0);
+        }
+    }
+
+    #[test]
+    fn adaptive_slices_respect_maximum_and_cover_tail() {
+        let limits = SlicePlanLimits {
+            max_bytes: 1024 * 1024,
+            min_bytes: 0,
+            max_extra_slices: 16,
+        };
+        let ranges = split_adaptive_slices(0, 8 * 1024 * 1024 - 1, limits);
+        assert!(!ranges.is_empty());
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges.last().unwrap().1, 8 * 1024 * 1024 - 1);
+        assert!(
+            ranges
+                .iter()
+                .all(|(start, end)| *end - *start < 1024 * 1024)
+        );
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1 + 1, pair[1].0);
+        }
+    }
+
+    #[test]
+    fn adaptive_planner_never_amplifies_large_file_requests() {
+        let len = 717_799_668u64;
+        let max_bytes = 1024 * 1024;
+        let static_count = static_slice_count(len, max_bytes) as usize;
+        let limits = SlicePlanLimits {
+            max_bytes,
+            min_bytes: 0,
+            max_extra_slices: 16,
+        };
+        let ranges = split_adaptive_slices(0, len - 1, limits);
+        assert!(!ranges.is_empty());
+        assert!(ranges.len() <= static_count + 16);
+        assert_eq!(ranges.last().unwrap().1, len - 1);
+        assert!(
+            ranges
+                .iter()
+                .take(ranges.len().saturating_sub(1))
+                .all(|(start, end)| *end - *start + 1 >= 256 * 1024)
+        );
+
+        // An explicit tiny minimum is still bounded by the request-count
+        // guard; with no slack the planner falls back to static slicing.
+        let fallback = split_adaptive_slices(
+            0,
+            len - 1,
+            SlicePlanLimits {
+                max_bytes,
+                min_bytes: 64 * 1024,
+                max_extra_slices: 0,
+            },
+        );
+        assert_eq!(fallback.len(), static_count);
+    }
+
+    #[test]
+    fn dlt_slices_are_bounded_and_cover_the_file() {
+        let end = 4 * 1024 * 1024 - 1;
+        let ranges = split_dlt_slices(
+            0,
+            end,
+            SlicePlanLimits {
+                max_bytes: 1024 * 1024,
+                min_bytes: 64 * 1024,
+                max_extra_slices: 16,
+            },
+            4,
+            250,
+            &[8_000_000, 2_000_000],
+        );
+        assert!(!ranges.is_empty());
+        assert_eq!(ranges.last().unwrap().1, end);
+        assert!(
+            ranges
+                .iter()
+                .all(|(start, stop)| *stop - *start < 1024 * 1024)
+        );
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1 + 1, pair[1].0);
         }
     }
 
@@ -2612,6 +2896,10 @@ mod integration {
             connect_timeout_secs: 10,
             max_slice_retries: 50,
             slice_bytes: 65536,
+            adaptive_slices: false,
+            slice_min_bytes: 4096,
+            dlt_rounds: 0,
+            dlt_round_ms: 250,
             body_buffer: 8,
             no_hedge: false,
             tunnel_only: false,
@@ -2620,6 +2908,7 @@ mod integration {
             max_tunnels: 8,
             max_downloads: 4,
             max_origin_connections: 32,
+            max_origin_per_host: 32,
             egress_routes: String::new(),
             egress_max_connections: 0,
             egress_failure_threshold: 2,

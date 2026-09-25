@@ -36,10 +36,26 @@ pub struct Config {
     pub max_slice_retries: u32,
 
     /// Slice granularity for striped multi-connection downloads, bytes.
-    /// Larger slices mean fewer, bigger requests; smaller slices stream
-    /// steadier and bound memory tighter. Keep well above a TCP frame.
+    /// This is the hard maximum range size; adaptive planning may use
+    /// smaller ranges but never larger ones.
     #[arg(long, default_value_t = 1024 * 1024)]
     pub slice_bytes: u64,
+
+    /// Enable bounded adaptive/HFSS-style range sizing.
+    #[arg(long, default_value_t = false)]
+    pub adaptive_slices: bool,
+
+    /// Smallest adaptive range; 0 selects a safe value tied to --slice-bytes.
+    #[arg(long, default_value_t = 0)]
+    pub slice_min_bytes: u64,
+
+    /// Bounded DLT planning rounds; 0 uses the adaptive planner only.
+    #[arg(long, default_value_t = 0)]
+    pub dlt_rounds: u32,
+
+    /// Target duration of one DLT planning round, milliseconds.
+    #[arg(long, default_value_t = 250)]
+    pub dlt_round_ms: u64,
 
     /// Bounded channel depth for the downstream body
     #[arg(long, default_value_t = 16)]
@@ -75,6 +91,11 @@ pub struct Config {
     /// Concurrent origin connections total (all downloads + probe/hedge)
     #[arg(long, default_value_t = 64)]
     pub max_origin_connections: usize,
+
+    /// Concurrent range requests allowed to one origin authority.
+    /// Defaults to the global origin budget to preserve legacy throughput.
+    #[arg(long, default_value_t = 64)]
+    pub max_origin_per_host: usize,
 
     /// Weighted origin egress routes, e.g. `eth0=4,wg0=1`.
     /// Empty preserves the default system route.
@@ -171,6 +192,14 @@ impl Config {
         let retention_slices = (self.workers as u64) * if self.no_hedge { 1 } else { 2 };
         let max_slice_bytes = (MAX_WORKER_RETENTION / retention_slices).max(1024);
         clamp(&mut self.slice_bytes, 1024, max_slice_bytes, "slice_bytes");
+        clamp(
+            &mut self.slice_min_bytes,
+            0,
+            self.slice_bytes,
+            "slice_min_bytes",
+        );
+        clamp(&mut self.dlt_rounds, 0, 64, "dlt_rounds");
+        clamp(&mut self.dlt_round_ms, 10, 60_000, "dlt_round_ms");
         clamp(&mut self.body_buffer, 1, 256, "body_buffer");
         clamp(&mut self.max_connections, 1, 4096, "max_connections");
         clamp(&mut self.max_tunnels, 1, 4096, "max_tunnels");
@@ -191,6 +220,12 @@ impl Config {
             1,
             4096,
             "max_origin_connections",
+        );
+        clamp(
+            &mut self.max_origin_per_host,
+            1,
+            self.max_origin_connections,
+            "max_origin_per_host",
         );
         if self.egress_max_connections > 0 {
             clamp(
@@ -261,6 +296,10 @@ mod tests {
         assert_eq!(cfg.max_tunnels, 64);
         assert_eq!(cfg.max_downloads, 16);
         assert_eq!(cfg.max_origin_connections, 64);
+        assert_eq!(cfg.max_origin_per_host, 64);
+        assert!(!cfg.adaptive_slices);
+        assert_eq!(cfg.slice_min_bytes, 0);
+        assert_eq!(cfg.dlt_rounds, 0);
         assert_eq!(cfg.workers, 8);
         assert_eq!(cfg.slice_bytes, 1024 * 1024);
     }
@@ -297,6 +336,10 @@ mod tests {
             connect_timeout_secs: 0,
             max_slice_retries: 0,
             slice_bytes: 1,
+            adaptive_slices: true,
+            slice_min_bytes: 0,
+            dlt_rounds: 999,
+            dlt_round_ms: 0,
             body_buffer: 0,
             no_hedge: false,
             tunnel_only: false,
@@ -305,6 +348,7 @@ mod tests {
             max_tunnels: 0,
             max_downloads: 0,
             max_origin_connections: 0,
+            max_origin_per_host: 0,
             egress_routes: String::new(),
             egress_max_connections: 0,
             egress_failure_threshold: 0,
@@ -333,6 +377,10 @@ mod tests {
         assert_eq!(cfg.egress_failure_threshold, 1);
         assert_eq!(cfg.egress_cooldown_secs, 1);
         assert_eq!(cfg.egress_retry_budget, 1);
+        assert_eq!(cfg.max_origin_per_host, 1);
         assert_eq!(cfg.slice_bytes, 1024);
+        assert_eq!(cfg.slice_min_bytes, 0);
+        assert_eq!(cfg.dlt_rounds, 64);
+        assert_eq!(cfg.dlt_round_ms, 10);
     }
 }

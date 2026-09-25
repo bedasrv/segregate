@@ -31,9 +31,16 @@ cargo run --release -- --tunnel-only
 - `--workers N` (default 8, alias `--segments`): concurrent origin connections per download.
 - `--min-segment BYTES` (default 1048576): files smaller than this use a
   single connection instead of striping.
-- `--slice-bytes BYTES` (default 1048576): granularity of striped
-  multi-connection downloads. Smaller slices stream steadier and bound
-  memory tighter at the cost of more origin requests.
+- `--slice-bytes BYTES` (default 1048576): hard maximum range size for
+  striped downloads. Smaller slices stream steadier and bound memory tighter.
+- `--adaptive-slices`: enable bounded HFSS-style sizing. Ranges may shrink
+  below `--slice-bytes` for later rounds and the reserved tail, but never
+  exceed it.
+- `--slice-min-bytes BYTES` (default 0): lower bound used by adaptive tail
+  planning; 0 selects a safe value tied to `--slice-bytes`.
+- `--dlt-rounds N` (default 0): enable bounded multi-round DLT planning when
+  multiple egress routes are configured; 0 uses HFSS planning only.
+- `--dlt-round-ms MS` (default 250): target duration used by DLT planning.
 - `--timeout-secs S` (default 10): idle gap allowed between body chunks,
   downstream or origin. Retries resume from the current offset, so transient
   stalls stay well under the client's own socket timeout; a downstream that
@@ -58,6 +65,11 @@ cargo run --release -- --tunnel-only
   excess gets `503` + `Retry-After` instead of queueing unboundedly.
 - `--max-origin-connections N` (default 64): total concurrent origin
   exchanges and raw CONNECT sockets, including probe/segment/hedge/passthrough.
+- `--max-origin-per-host N` (default 64): concurrent range requests to one
+  origin authority. The default matches the global origin budget to avoid
+  reducing legacy fan-out; lower it when an origin needs stricter admission.
+  `Retry-After` on `429`/`503` temporarily gates that authority without
+  marking the network egress unhealthy.
 - `--egress-routes "eth0=4,wg0=1"`: opt-in weighted origin egress pool.
   Each name is a network interface passed to `HttpConnector`; `default` uses
   the system-selected route. The pool is disabled when this is empty.
@@ -101,8 +113,10 @@ absurd values fail safe instead of exhausting tasks, channels, or memory.
 `downloads`, `bytes_out`, `buffered_bytes` (completed-but-unflushed slice
 bytes currently held), `origin_retries`, `hedges`, `truncations`,
 `cache_hits`, `refused` (CONNECT-denied + 503-overload),
-`connect_errors`, `uptime_secs`, and an `egress` array with each configured
-route's weight, health, current availability, request count, transport errors,
+`connect_errors`, `uptime_secs`, `completed_downloads`,
+`download_ms_total`, `download_ms_max`, `work_steals`, and an `egress` array
+with each configured route's weight, health, availability, in-flight count,
+bytes, estimated bytes/second, estimated RTT, request count, transport errors,
 and retry count.
 Interface names are operator labels; `/__stats` does not expose client data.
 
@@ -161,15 +175,23 @@ wget -e use_proxy=yes -e http_proxy=127.0.0.1:8080 --timeout=30 --tries=10 http:
 2. A first real range is checked before fan-out. If the origin ignores
    Range, the proxy switches to one linear full-body response instead of
    downloading and discarding a growing prefix for every slice. Otherwise
-   range-capable files with a strong validator are striped into
-   `--slice-bytes` slices; N workers pull indices past a bounded completion
-   window (no coordinator lock), each with timeout + resume-from-offset
-   retry. `Content-Range` and validators must match every slice; a mismatch
-   invalidates the metadata and safely truncates for client resume. Files
-   below `--min-segment`, or without a safe validator, use one connection.
-3. A slice that goes idle mid-body races one bounded duplicate request
-   (headers + first chunk only) against the stalled connection and keeps
-   whichever delivers first.
+   range-capable files with a strong validator are striped into bounded
+   slices. With `--adaptive-slices`, HFSS-style planning reserves a small tail
+   and progressively reduces later ranges; it falls back to static slicing if
+   that would amplify the request count. With `--dlt-rounds` and multiple
+   egress routes, bounded DLT rounds use measured rate hints. `--slice-bytes`
+   remains the hard maximum in every mode. N workers pull indices past a bounded
+   completion window (no coordinator lock), each with timeout + resume-from-
+   offset retry. `Content-Range` and validators must match every slice; a
+   mismatch invalidates the metadata and safely truncates for client resume.
+   Files below `--min-segment`, or without a safe validator, use one
+   connection.
+3. Each egress maintains an EWMA byte-rate and RTT estimate. When multiple
+   routes exist, sized range requests are assigned by predicted completion
+   time (queue delay + RTT + bytes/rate), with configured weights as the
+   fallback. A slice whose observed progress falls below one quarter of the
+   route estimate can hand its tail to one bounded duplicate request; the
+   stalled HTTP/1.1 body is dropped and only the first completion is kept.
 4. Origin chunks are truncated to the requested window so a buggy origin
    can never corrupt downstream `Content-Length` framing.
 5. A coordinator flushes completed slices strictly in order into the
@@ -182,7 +204,9 @@ wget -e use_proxy=yes -e http_proxy=127.0.0.1:8080 --timeout=30 --tries=10 http:
 6. Downstream always sees valid HTTP framing: transport errors become
    502, stalls truncate (resumable via `Range`, incl. suffix ranges
    `bytes=-N`), never a dropped socket. Single-connection passthrough
-   has the same idle timeout.
+   has the same idle timeout. A bounded per-authority admission gate limits
+   range concurrency and honors `Retry-After` without turning origin policy
+   responses into network-health failures.
 7. `CONNECT` defaults to MITM (per-connection leaf signed by a run-local
    CA, verified-TLS re-originate, correct IPv6/scheme handling, port
    preserved) so HTTPS gets the same fan-out; `--tunnel-only` relays
@@ -196,12 +220,12 @@ wget -e use_proxy=yes -e http_proxy=127.0.0.1:8080 --timeout=30 --tries=10 http:
 9. Origin connections are HTTP/1.1 only: segmentation needs one TCP
    connection per segment (HTTP/2 would multiplex everything onto one),
    and plain HTTP/1.1 is accepted by the pickiest WAFs. An optional weighted
-   egress pool gives each configured interface its own connector and active
-   quota. Transport failures consume a bounded per-route budget; unhealthy
-   routes leave the selection set until cooldown recovery, allowing bounded
-   retries to fail over without retrying HTTP status errors. On Linux,
-   interface binding uses `SO_BINDTODEVICE` and may require elevated
-   privileges.
+   egress pool gives each configured interface its own connector, active
+   quota, throughput/RTT estimates, and health state. Transport failures
+   consume a bounded per-route budget; unhealthy routes leave the selection
+   set until cooldown recovery, allowing bounded retries to fail over without
+   retrying HTTP status errors. On Linux, interface binding uses
+   `SO_BINDTODEVICE` and may require elevated privileges.
 
 ## Tests
 

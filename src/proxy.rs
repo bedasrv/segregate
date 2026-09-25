@@ -410,10 +410,13 @@ async fn tunnel(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "CONNECT upgrade timeout"))?
         .map_err(std::io::Error::other)?;
     let mut up = TokioIo::new(upgraded);
-    let mut origin_permit = tokio::time::timeout(connect_timeout(shared), shared.origin.acquire())
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "origin permit timeout"))?
-        .map_err(|error| std::io::Error::other(format!("origin permit: {error:?}")))?;
+    let mut origin_permit = tokio::time::timeout(
+        connect_timeout(shared),
+        shared.origin.acquire_for(authority),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "origin permit timeout"))?
+    .map_err(|error| std::io::Error::other(format!("origin permit: {error:?}")))?;
     let interface = origin_permit.interface().map(str::to_owned);
     let mut origin = match tokio::time::timeout(
         connect_timeout(shared),
@@ -597,6 +600,10 @@ mod tests {
                 connect_timeout_secs: 5,
                 max_slice_retries: 5,
                 slice_bytes: 65536,
+                adaptive_slices: false,
+                slice_min_bytes: 4096,
+                dlt_rounds: 0,
+                dlt_round_ms: 250,
                 body_buffer: 8,
                 no_hedge: true,
                 tunnel_only: false,
@@ -605,6 +612,7 @@ mod tests {
                 max_tunnels: 8,
                 max_downloads: 4,
                 max_origin_connections: 8,
+                max_origin_per_host: 8,
                 egress_routes: String::new(),
                 egress_max_connections: 0,
                 egress_failure_threshold: 2,

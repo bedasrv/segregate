@@ -58,19 +58,24 @@ async fn main() -> std::io::Result<()> {
         let client =
             segment::build_client(cfg.origin_ca_bundle.as_deref(), cfg.max_origin_connections)
                 .map_err(std::io::Error::other)?;
-        state::Origin::new(client, cfg.max_origin_connections)
+        state::Origin::with_client_limit(
+            client,
+            cfg.max_origin_connections,
+            cfg.max_origin_per_host,
+        )
     } else {
         tracing::info!(
             routes = egress_clients.len(),
             "weighted origin egress pool enabled"
         );
-        state::Origin::with_routes(
+        state::Origin::with_routes_and_limit(
             egress_clients,
             cfg.max_origin_connections,
             cfg.egress_max_connections,
             cfg.egress_failure_threshold,
             Duration::from_secs(cfg.egress_cooldown_secs),
             cfg.egress_retry_budget,
+            cfg.max_origin_per_host,
         )
     };
 

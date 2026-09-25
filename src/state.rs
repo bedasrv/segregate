@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-use http::{HeaderMap, Uri};
+use http::{HeaderMap, StatusCode, Uri, uri::Authority};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use sha2::{Digest, Sha256};
@@ -33,6 +33,105 @@ pub struct Shared {
     pub started: Instant,
 }
 
+/// Per-authority origin admission. The map is deliberately bounded because
+/// the proxy accepts untrusted authority cardinality; the mutex only guards
+/// short map operations and is never held across an await.
+struct OriginAdmission {
+    max_per_host: usize,
+    max_entries: usize,
+    hosts: Mutex<HashMap<Authority, HostAdmission>>,
+}
+
+struct HostAdmission {
+    sem: Arc<Semaphore>,
+    blocked_until: Option<Instant>,
+}
+
+impl OriginAdmission {
+    fn new(max_per_host: usize) -> Self {
+        let max_per_host = max_per_host.max(1);
+        Self {
+            max_per_host,
+            max_entries: max_per_host.saturating_mul(16).clamp(64, 4096),
+            hosts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn snapshot(&self, authority: &Authority) -> (Arc<Semaphore>, Option<Instant>) {
+        let mut hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(host) = hosts.get(authority) {
+            return (host.sem.clone(), host.blocked_until);
+        }
+        if hosts.len() >= self.max_entries
+            && let Some(victim) = hosts.keys().next().cloned()
+        {
+            hosts.remove(&victim);
+        }
+        let sem = Arc::new(Semaphore::new(self.max_per_host));
+        hosts.insert(
+            authority.clone(),
+            HostAdmission {
+                sem: sem.clone(),
+                blocked_until: None,
+            },
+        );
+        (sem, None)
+    }
+
+    fn blocked_until(&self, authority: &Authority) -> Option<Instant> {
+        self.hosts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(authority)
+            .and_then(|host| host.blocked_until)
+    }
+
+    fn note_retry_after(&self, authority: &Authority, delay: Duration) {
+        let until = Instant::now() + delay;
+        let mut hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(host) = hosts.get_mut(authority) {
+            host.blocked_until = Some(host.blocked_until.map_or(until, |old| old.max(until)));
+        }
+    }
+
+    async fn acquire(
+        &self,
+        authority: Option<&Authority>,
+    ) -> Result<Option<OwnedSemaphorePermit>, OriginError> {
+        let Some(authority) = authority else {
+            return Ok(None);
+        };
+        let (sem, blocked_until) = self.snapshot(authority);
+        loop {
+            if let Some(until) = blocked_until
+                && until > Instant::now()
+            {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(until)).await;
+                continue;
+            }
+            let permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| OriginError::PoolClosed)?;
+            if self
+                .blocked_until(authority)
+                .is_some_and(|until| until > Instant::now())
+            {
+                drop(permit);
+                continue;
+            }
+            return Ok(Some(permit));
+        }
+    }
+}
+
 /// One origin egress. The global semaphore bounds all active origin streams;
 /// each route additionally has its own active-stream quota.
 struct EgressRoute {
@@ -45,6 +144,10 @@ struct EgressRoute {
     requests: AtomicU64,
     errors: AtomicU64,
     retries: AtomicU64,
+    bytes: AtomicU64,
+    rate_bps: AtomicU64,
+    rtt_us: AtomicU64,
+    inflight: AtomicU64,
     failure_threshold: u32,
     cooldown: Duration,
     retry_budget: u32,
@@ -82,6 +185,10 @@ impl EgressRoute {
             requests: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             retries: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            rate_bps: AtomicU64::new(0),
+            rtt_us: AtomicU64::new(0),
+            inflight: AtomicU64::new(0),
             failure_threshold: failure_threshold.max(1),
             cooldown,
             retry_budget,
@@ -152,6 +259,57 @@ impl EgressRoute {
     fn is_healthy(&self) -> bool {
         self.health().healthy
     }
+
+    fn record_rtt(&self, elapsed: Duration) {
+        let sample = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        self.rtt_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(if old == 0 {
+                    sample
+                } else {
+                    old.saturating_mul(7) / 8 + sample / 8
+                })
+            })
+            .ok();
+    }
+
+    fn record_bytes(&self, bytes: u64, elapsed: Duration) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        let nanos = elapsed.as_nanos();
+        if nanos == 0 {
+            return;
+        }
+        let sample =
+            ((bytes as u128).saturating_mul(1_000_000_000) / nanos).min(u64::MAX as u128) as u64;
+        self.rate_bps
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(if old == 0 {
+                    sample
+                } else {
+                    old.saturating_mul(7) / 8 + sample / 8
+                })
+            })
+            .ok();
+    }
+
+    fn completion_cost(&self, bytes: u64) -> u64 {
+        let rate = self.rate_bps.load(Ordering::Relaxed);
+        if rate == 0 {
+            return u64::MAX / 4;
+        }
+        let transfer_ns = ((bytes as u128).saturating_mul(1_000_000_000) / rate as u128)
+            .min(u64::MAX as u128) as u64;
+        let rtt_ns = self.rtt_us.load(Ordering::Relaxed).saturating_mul(1_000);
+        let queue_ns = self
+            .inflight
+            .load(Ordering::Relaxed)
+            .saturating_mul(250_000);
+        rtt_ns.saturating_add(transfer_ns).saturating_add(queue_ns)
+    }
+
+    fn estimated_rate(&self) -> u64 {
+        self.rate_bps.load(Ordering::Relaxed)
+    }
 }
 
 /// A global origin permit plus the selected egress quota. Dropping an
@@ -159,9 +317,14 @@ impl EgressRoute {
 /// outer timeout cancels an in-flight `Origin::get` future.
 pub struct OriginPermit {
     _global: OwnedSemaphorePermit,
+    _authority: Option<OwnedSemaphorePermit>,
     route: Arc<EgressRoute>,
     _route: OwnedSemaphorePermit,
     settled: bool,
+    request_started: Option<Instant>,
+    sample_started: Instant,
+    sample_bytes: u64,
+    rtt_recorded: bool,
 }
 
 impl OriginPermit {
@@ -169,7 +332,36 @@ impl OriginPermit {
         self.route.interface.as_deref()
     }
 
+    pub fn estimated_rate(&self) -> u64 {
+        self.route.estimated_rate()
+    }
+
+    pub fn record_bytes(&mut self, bytes: u64) {
+        self.sample_bytes = self.sample_bytes.saturating_add(bytes);
+        if self.sample_bytes >= 256 * 1024
+            || self.sample_started.elapsed() >= Duration::from_millis(250)
+        {
+            self.flush_sample();
+        }
+    }
+
+    fn flush_sample(&mut self) {
+        if self.sample_bytes == 0 {
+            self.sample_started = Instant::now();
+            return;
+        }
+        self.route
+            .record_bytes(self.sample_bytes, self.sample_started.elapsed());
+        self.sample_bytes = 0;
+        self.sample_started = Instant::now();
+    }
+
     pub fn mark_success(&mut self) {
+        if !self.rtt_recorded {
+            let started = self.request_started.unwrap_or(self.sample_started);
+            self.route.record_rtt(started.elapsed());
+            self.rtt_recorded = true;
+        }
         if !self.settled {
             self.route.mark_success();
             self.settled = true;
@@ -186,6 +378,8 @@ impl OriginPermit {
 
 impl Drop for OriginPermit {
     fn drop(&mut self) {
+        self.flush_sample();
+        self.route.inflight.fetch_sub(1, Ordering::Relaxed);
         if !self.settled {
             self.route.mark_failure();
         }
@@ -200,11 +394,21 @@ pub struct Origin {
     routes: Arc<Vec<Arc<EgressRoute>>>,
     sem: Arc<Semaphore>,
     cursor: Arc<AtomicU64>,
+    admission: Arc<OriginAdmission>,
 }
 
 impl Origin {
+    #[cfg(test)]
     pub fn new(client: ProxyClient, max_connections: usize) -> Self {
-        Self::with_routes(
+        Self::with_client_limit(client, max_connections, max_connections)
+    }
+
+    pub fn with_client_limit(
+        client: ProxyClient,
+        max_connections: usize,
+        max_per_host: usize,
+    ) -> Self {
+        Self::with_routes_and_limit(
             vec![EgressClient {
                 name: "default".to_owned(),
                 interface: None,
@@ -216,11 +420,13 @@ impl Origin {
             2,
             Duration::from_secs(30),
             2,
+            max_per_host,
         )
     }
 
     /// Build a weighted origin pool. `egress_max_connections == 0` means each
     /// route gets the same quota as the global cap.
+    #[cfg(test)]
     pub fn with_routes(
         clients: Vec<EgressClient>,
         max_connections: usize,
@@ -228,6 +434,27 @@ impl Origin {
         failure_threshold: u32,
         cooldown: Duration,
         retry_budget: u32,
+    ) -> Self {
+        Self::with_routes_and_limit(
+            clients,
+            max_connections,
+            egress_max_connections,
+            failure_threshold,
+            cooldown,
+            retry_budget,
+            max_connections,
+        )
+    }
+
+    /// Build a weighted origin pool with per-authority admission control.
+    pub fn with_routes_and_limit(
+        clients: Vec<EgressClient>,
+        max_connections: usize,
+        egress_max_connections: usize,
+        failure_threshold: u32,
+        cooldown: Duration,
+        retry_budget: u32,
+        max_per_host: usize,
     ) -> Self {
         let route_quota = if egress_max_connections == 0 {
             max_connections
@@ -250,44 +477,82 @@ impl Origin {
             routes: Arc::new(routes),
             sem: Arc::new(Semaphore::new(max_connections.max(1))),
             cursor: Arc::new(AtomicU64::new(0)),
+            admission: Arc::new(OriginAdmission::new(max_per_host)),
         }
     }
 
-    fn select_route(&self) -> Arc<EgressRoute> {
-        let available: Vec<&Arc<EgressRoute>> = self
-            .routes
+    pub fn route_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// One allocation per download planner, not per request. A zero estimate
+    /// falls back to the configured weight.
+    pub fn rate_hints(&self) -> Vec<u64> {
+        self.routes
             .iter()
-            .filter(|route| route.available())
-            .collect();
-        let candidates = if available.is_empty() {
-            self.routes.iter().collect()
-        } else {
-            available
-        };
-        let total = candidates
-            .iter()
-            .map(|route| route.weight as u64)
-            .sum::<u64>()
-            .max(1);
+            .map(|route| {
+                let rate = route.estimated_rate();
+                if rate == 0 {
+                    route.weight as u64 * 1_000_000
+                } else {
+                    rate
+                }
+            })
+            .collect()
+    }
+
+    fn select_route(&self, expected_bytes: u64) -> Arc<EgressRoute> {
+        let has_estimates = self.routes.iter().any(|route| route.estimated_rate() > 0);
+        if self.routes.len() > 1 && expected_bytes > 0 && has_estimates {
+            let mut best: Option<(&Arc<EgressRoute>, u64)> = None;
+            for route in self.routes.iter().filter(|route| route.available()) {
+                let cost = route.completion_cost(expected_bytes);
+                if best.is_none_or(|(_, best_cost)| cost < best_cost) {
+                    best = Some((route, cost));
+                }
+            }
+            if let Some((route, _)) = best {
+                return Arc::clone(route);
+            }
+        }
+
+        let mut total = 0u64;
+        for route in self.routes.iter().filter(|route| route.available()) {
+            total = total.saturating_add(route.weight as u64);
+        }
+        let use_all = total == 0;
+        if use_all {
+            total = self
+                .routes
+                .iter()
+                .map(|route| route.weight as u64)
+                .sum::<u64>()
+                .max(1);
+        }
         let mut point = self.cursor.fetch_add(1, Ordering::Relaxed) % total;
-        for route in &candidates {
+        for route in self.routes.iter() {
+            if !use_all && !route.available() {
+                continue;
+            }
             let weight = route.weight as u64;
             if point < weight {
                 return Arc::clone(route);
             }
             point -= weight;
         }
-        candidates
-            .first()
-            .map(|route| Arc::clone(route))
+        self.routes
+            .iter()
+            .find(|route| route.available())
+            .map(Arc::clone)
+            .or_else(|| self.routes.first().map(Arc::clone))
             .expect("Origin must contain at least one route")
     }
 
-    async fn acquire_route(&self) -> Result<(Arc<EgressRoute>, OriginPermit), OriginError> {
+    async fn acquire_route(&self, expected_bytes: u64) -> Result<OriginPermit, OriginError> {
         // Prefer a non-full route so one saturated interface cannot head-of-
         // line block all other egresses. If all are full, wait on one route.
         for _ in 0..self.routes.len() {
-            let route = self.select_route();
+            let route = self.select_route(expected_bytes);
             let Ok(route_permit) = route.sem.clone().try_acquire_owned() else {
                 continue;
             };
@@ -298,17 +563,20 @@ impl Origin {
                 .await
                 .map_err(|_| OriginError::PoolClosed)?;
             route.requests.fetch_add(1, Ordering::Relaxed);
-            return Ok((
-                route.clone(),
-                OriginPermit {
-                    _global: global_permit,
-                    route,
-                    _route: route_permit,
-                    settled: false,
-                },
-            ));
+            route.inflight.fetch_add(1, Ordering::Relaxed);
+            return Ok(OriginPermit {
+                _global: global_permit,
+                _authority: None,
+                route,
+                _route: route_permit,
+                settled: false,
+                request_started: None,
+                sample_started: Instant::now(),
+                sample_bytes: 0,
+                rtt_recorded: false,
+            });
         }
-        let route = self.select_route();
+        let route = self.select_route(expected_bytes);
         let route_permit = route
             .sem
             .clone()
@@ -322,31 +590,80 @@ impl Origin {
             .await
             .map_err(|_| OriginError::PoolClosed)?;
         route.requests.fetch_add(1, Ordering::Relaxed);
-        Ok((
-            route.clone(),
-            OriginPermit {
-                _global: global_permit,
-                route,
-                _route: route_permit,
-                settled: false,
-            },
-        ))
+        route.inflight.fetch_add(1, Ordering::Relaxed);
+        Ok(OriginPermit {
+            _global: global_permit,
+            _authority: None,
+            route,
+            _route: route_permit,
+            settled: false,
+            request_started: None,
+            sample_started: Instant::now(),
+            sample_bytes: 0,
+            rtt_recorded: false,
+        })
     }
 
-    /// Acquire one active-origin permit for raw CONNECT tunnels.
+    async fn acquire_exchange(
+        &self,
+        authority: Option<&Authority>,
+        expected_bytes: u64,
+    ) -> Result<OriginPermit, OriginError> {
+        let authority_permit = self.admission.acquire(authority).await?;
+        let mut permit = self.acquire_route(expected_bytes).await?;
+        permit._authority = authority_permit;
+        Ok(permit)
+    }
+
+    /// Test helper for acquiring a route permit without an authority.
+    #[cfg(test)]
     pub async fn acquire(&self) -> Result<OriginPermit, OriginError> {
-        self.acquire_route().await.map(|(_, permit)| permit)
+        self.acquire_exchange(None, 0).await
     }
 
-    /// One origin exchange: acquires a global and route permit, then issues
-    /// the request. Hold the permit while streaming the body.
+    /// Acquire an origin permit for a raw CONNECT authority, including
+    /// per-authority admission control.
+    pub async fn acquire_for(&self, authority: &str) -> Result<OriginPermit, OriginError> {
+        let authority = authority.parse::<Authority>().ok();
+        self.acquire_exchange(authority.as_ref(), 0).await
+    }
+
+    /// One origin exchange: acquires authority, global, and route permits,
+    /// then issues the request. Hold the permit while streaming the body.
     pub async fn get(
         &self,
         req: Request<BoxBody>,
     ) -> Result<(Response<Incoming>, OriginPermit), OriginError> {
-        let (route, mut permit) = self.acquire_route().await?;
+        self.get_sized(req, 0).await
+    }
+
+    /// Sized variant used by the range scheduler. The expected byte count is
+    /// only a prediction hint; it never changes the requested HTTP range.
+    pub async fn get_sized(
+        &self,
+        req: Request<BoxBody>,
+        expected_bytes: u64,
+    ) -> Result<(Response<Incoming>, OriginPermit), OriginError> {
+        let authority = req.uri().authority().cloned();
+        let mut permit = self
+            .acquire_exchange(authority.as_ref(), expected_bytes)
+            .await?;
+        let route = permit.route.clone();
+        let request_started = Instant::now();
+        permit.request_started = Some(request_started);
+        permit.sample_started = request_started;
         match route.client.request(req).await {
             Ok(response) => {
+                if let Some(authority) = authority.as_ref()
+                    && matches!(
+                        response.status(),
+                        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+                    )
+                {
+                    let delay =
+                        retry_after(response.headers()).unwrap_or(Duration::from_millis(250));
+                    self.admission.note_retry_after(authority, delay);
+                }
                 permit.mark_success();
                 Ok((response, permit))
             }
@@ -372,10 +689,14 @@ impl Origin {
                     })
                     .collect::<String>();
                 format!(
-                    "{{\"name\":\"{name}\",\"weight\":{},\"healthy\":{},\"available\":{},\"requests\":{},\"transport_errors\":{},\"retries\":{}}}",
+                    "{{\"name\":\"{name}\",\"weight\":{},\"healthy\":{},\"available\":{},\"inflight\":{},\"bytes\":{},\"rate_bps\":{},\"rtt_us\":{},\"requests\":{},\"transport_errors\":{},\"retries\":{}}}",
                     route.weight,
                     route.is_healthy(),
                     route.available(),
+                    route.inflight.load(Ordering::Relaxed),
+                    route.bytes.load(Ordering::Relaxed),
+                    route.rate_bps.load(Ordering::Relaxed),
+                    route.rtt_us.load(Ordering::Relaxed),
                     route.requests.load(Ordering::Relaxed),
                     route.errors.load(Ordering::Relaxed),
                     route.retries.load(Ordering::Relaxed),
@@ -384,6 +705,12 @@ impl Origin {
             .collect::<Vec<_>>()
             .join(",")
     }
+}
+
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(http::header::RETRY_AFTER)?.to_str().ok()?;
+    let seconds = value.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds.min(60)))
 }
 
 /// How one origin exchange can fail. `PoolClosed` documents an invariant
@@ -693,12 +1020,16 @@ impl ProbeCache {
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub downloads: AtomicU64,
+    pub completed_downloads: AtomicU64,
+    pub download_ms_total: AtomicU64,
+    pub download_ms_max: AtomicU64,
     pub bytes_out: AtomicU64,
     /// Completed-but-unflushed slice bytes currently held (never leaks:
     /// the coordinator subtracts the remainder however it exits).
     pub buffered_bytes: AtomicU64,
     pub origin_retries: AtomicU64,
     pub hedges: AtomicU64,
+    pub work_steals: AtomicU64,
     pub truncations: AtomicU64,
     pub cache_hits: AtomicU64,
     /// Requests refused before any origin work (CONNECT denied, 503).
@@ -717,12 +1048,16 @@ impl Metrics {
     pub fn render_json_with_egress(&self, uptime_secs: u64, egress_json: &str) -> String {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         format!(
-            "{{\"downloads\":{},\"bytes_out\":{},\"buffered_bytes\":{},\"origin_retries\":{},\"hedges\":{},\"truncations\":{},\"cache_hits\":{},\"refused\":{},\"connect_errors\":{},\"uptime_secs\":{},\"egress\":[{egress_json}]}}",
+            "{{\"downloads\":{},\"completed_downloads\":{},\"download_ms_total\":{},\"download_ms_max\":{},\"bytes_out\":{},\"buffered_bytes\":{},\"origin_retries\":{},\"hedges\":{},\"work_steals\":{},\"truncations\":{},\"cache_hits\":{},\"refused\":{},\"connect_errors\":{},\"uptime_secs\":{},\"egress\":[{egress_json}]}}",
             load(&self.downloads),
+            load(&self.completed_downloads),
+            load(&self.download_ms_total),
+            load(&self.download_ms_max),
             load(&self.bytes_out),
             load(&self.buffered_bytes),
             load(&self.origin_retries),
             load(&self.hedges),
+            load(&self.work_steals),
             load(&self.truncations),
             load(&self.cache_hits),
             load(&self.refused),
@@ -1117,6 +1452,7 @@ mod tests {
         drop(permit);
         let mut permit = origin.acquire().await.unwrap();
         permit.mark_success();
+        permit.record_bytes(4096);
         drop(permit);
         let json = origin.egress_json();
         assert!(json.contains("\"name\":\"primary\""));
@@ -1124,6 +1460,8 @@ mod tests {
         assert!(json.contains("\"weight\":3"));
         assert!(json.contains("\"transport_errors\":1"));
         assert!(json.contains("\"requests\":1"));
+        assert!(json.contains("\"bytes\":4096"));
+        assert!(json.contains("\"inflight\":0"));
     }
 
     #[test]
